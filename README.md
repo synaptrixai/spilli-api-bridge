@@ -17,6 +17,39 @@ npm start
 ```
 
 
+## Docker
+
+Build and run with Docker Compose:
+
+```sh
+docker compose up --build
+```
+
+By default, Compose maps:
+
+- Host port `8888` to container port `8888`.
+- Host PEM directory `${HOME}/.spilli` to `/home/node/.spilli` read-only inside the container.
+
+Override the PEM directory or host port when needed:
+
+```sh
+SPILLI_PEM_DIR=/path/to/.spilli SPILLI_BRIDGE_PORT=8889 docker compose up --build
+```
+
+Inside Docker, the bridge uses:
+
+```env
+SPILLI_BRIDGE_HOST=0.0.0.0
+SPILLI_BRIDGE_PORT=8888
+SPILLI_KEY_PATH=/home/node/.spilli
+```
+
+Host processes can then use:
+
+```sh
+export ANTHROPIC_BASE_URL="http://localhost:8888"
+```
+
 ## Claude Code
 
 ```sh

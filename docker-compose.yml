@@ -1,0 +1,21 @@
+services:
+  spilli-api-bridge:
+    build:
+      context: .
+    image: spilli-api-bridge:latest
+    container_name: spilli-api-bridge
+    restart: unless-stopped
+    ports:
+      - "${SPILLI_BRIDGE_PORT:-8888}:8888"
+    environment:
+      SPILLI_BRIDGE_HOST: 0.0.0.0
+      SPILLI_BRIDGE_PORT: 8888
+      SPILLI_KEY_PATH: /home/node/.spilli
+      SPILLI_BRIDGE_SCOPE: ${SPILLI_BRIDGE_SCOPE:-private}
+      SPILLI_BRIDGE_TEAM: ${SPILLI_BRIDGE_TEAM:-}
+      SPILLI_BRIDGE_AUTH_TOKEN: ${SPILLI_BRIDGE_AUTH_TOKEN:-}
+      SPILLI_BRIDGE_REQUEST_TIMEOUT_MS: ${SPILLI_BRIDGE_REQUEST_TIMEOUT_MS:-600000}
+      SPILLI_BRIDGE_MODEL_CACHE_TTL_MS: ${SPILLI_BRIDGE_MODEL_CACHE_TTL_MS:-30000}
+      SPILLI_BRIDGE_REUSE_SESSIONS: ${SPILLI_BRIDGE_REUSE_SESSIONS:-1}
+    volumes:
+      - ${SPILLI_PEM_DIR:-${HOME}/.spilli}:/home/node/.spilli:ro
