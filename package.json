@@ -1,0 +1,17 @@
+{
+  "name": "@synaptrix/spilli-api-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Anthropic/OpenAI-compatible API bridge for local SpiLLI model inference.",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs"
+  },
+  "dependencies": {
+    "@synaptrix/spilli": "^0.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
