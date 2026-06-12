@@ -15,6 +15,8 @@ const DEFAULT_PORT = 8888;
 const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_MODEL_CACHE_TTL_MS = 30_000;
 const DEFAULT_SPILLI_KEY_PATH = '~/.spilli';
+const DEFAULT_REQUEST_LOG_PATH = path.join(os.homedir(), '.spilli', 'spilli-api-bridge-requests.jsonl');
+const MAX_LOG_STRING_LENGTH = 20_000;
 const SPILLI_BACKEND_API_URL = 'https://sig.synaptrix.org';
 const SPILLI_HOST_NODES_PATH = '/api/getuserhosts';
 const SPILLI_HOST_NODE_DETAILS_PATH = '/api/gethostinfo';
@@ -32,7 +34,9 @@ const state = {
   pendingModelFetch: undefined,
   loadedEnvFiles: [],
   modelScope: 'public',
-  modelTeam: undefined
+  modelTeam: undefined,
+  resourceRunQueues: new Map(),
+  lastResolvedModelByScope: new Map()
 };
 
 
@@ -560,7 +564,7 @@ function normalizeModelLookupName(value) {
 }
 
 async function fetchAvailableModels(config, { forceRefresh = false } = {}) {
-  const cacheKey = `${config.keyPath}|${config.scope}|${config.team}`;
+  const cacheKey = catalogCacheKey(config);
   const now = Date.now();
   if (
     !forceRefresh &&
@@ -694,14 +698,30 @@ function resolveModelFromCatalog(requestedModel, catalog) {
 
 async function resolveRequestedModel(requestedModel, config) {
   let catalog = await fetchAvailableModels(config);
+  const cacheKey = catalogCacheKey(config);
   try {
-    return resolveModelFromCatalog(requestedModel, catalog);
+    const resolved = resolveModelFromCatalog(requestedModel, catalog);
+    state.lastResolvedModelByScope.set(cacheKey, resolved);
+    return resolved;
   } catch (err) {
     if (err?.statusCode !== 404) {
       throw err;
     }
     catalog = await fetchAvailableModels(config, { forceRefresh: true });
-    return resolveModelFromCatalog(requestedModel, catalog);
+    try {
+      const resolved = resolveModelFromCatalog(requestedModel, catalog);
+      state.lastResolvedModelByScope.set(cacheKey, resolved);
+      return resolved;
+    } catch (refreshedErr) {
+      if (refreshedErr?.statusCode === 404 && isClaudeCodeBuiltInModelName(requestedModel)) {
+        const fallback = state.lastResolvedModelByScope.get(cacheKey) ?? catalog.models[0];
+        if (fallback) {
+          console.warn(`Mapping Claude Code model alias "${requestedModel}" to SpiLLI model "${fallback.apiName}".`);
+          return fallback;
+        }
+      }
+      throw refreshedErr;
+    }
   }
 }
 
@@ -821,7 +841,223 @@ function collectToolCalls(value, calls) {
   }
 }
 
-function parseToolCallsFromOutput(raw) {
+function normalizeToolNameForLookup(value) {
+  return asString(value).trim().toLowerCase();
+}
+
+function catalogCacheKey(config) {
+  return `${config.keyPath}|${config.scope}|${config.team}`;
+}
+
+function isClaudeCodeBuiltInModelName(value) {
+  return /^claude[-_]/i.test(asString(value).trim());
+}
+
+function extractAvailableToolNames(tools) {
+  if (!Array.isArray(tools)) {
+    return [];
+  }
+  return tools
+    .map(tool => (isRecord(tool) ? asString(tool.name || tool.function?.name).trim() : ''))
+    .filter(Boolean);
+}
+
+function resolveAllowedToolName(name, allowedToolNames = []) {
+  const trimmed = asString(name).trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const aliases = new Map([
+    ['shell', 'Bash'],
+    ['terminal', 'Bash']
+  ]);
+  const preferred = aliases.get(normalizeToolNameForLookup(trimmed)) ?? trimmed;
+  if (!allowedToolNames.length) {
+    return preferred;
+  }
+  const normalized = normalizeToolNameForLookup(preferred);
+  return allowedToolNames.find(candidate => normalizeToolNameForLookup(candidate) === normalized);
+}
+
+function formatPseudoToolPrompt(name, input) {
+  if (typeof input === 'string' && input.trim()) {
+    return input.trim();
+  }
+  if (!isRecord(input)) {
+    return `Complete the requested ${name} task.`;
+  }
+  const directPrompt = asString(input.prompt || input.query || input.task || input.instruction || input.instructions).trim();
+  const pathText = asString(input.path || input.cwd || input.directory).trim();
+  const breadth = asString(input.breadth).trim();
+  const parts = [];
+  if (directPrompt) {
+    parts.push(directPrompt);
+  }
+  if (pathText) {
+    parts.push(`Work under path: ${pathText}`);
+  }
+  if (breadth) {
+    parts.push(`Breadth: ${breadth}`);
+  }
+  return parts.length ? parts.join('\n') : `Complete the requested ${name} task with input: ${JSON.stringify(input)}`;
+}
+
+function pseudoToolBaseName(name) {
+  return normalizeToolNameForLookup(name).split(/[:\s]/)[0];
+}
+
+function pseudoToolDescription(name, input) {
+  const normalized = pseudoToolBaseName(name);
+  return (
+    asString(input?.description || input?.title || input?.query || input?.prompt).trim() ||
+    (asString(name).includes(':') ? asString(name).slice(asString(name).indexOf(':') + 1).trim() : '') ||
+    (normalized === 'explore' ? 'Explore workspace' : 'Run delegated task')
+  ).slice(0, 80);
+}
+
+function normalizeAgentToolInput(call) {
+  const input = call.input;
+  if (isRecord(input) && typeof input.description === 'string' && typeof input.prompt === 'string') {
+    return input;
+  }
+  const normalized = pseudoToolBaseName(call.name);
+  const subagentType =
+    isRecord(input) && typeof input.subagent_type === 'string'
+      ? input.subagent_type
+      : normalized === 'explore'
+        ? 'Explore'
+        : 'general-purpose';
+  return {
+    description: pseudoToolDescription(call.name, input),
+    prompt: formatPseudoToolPrompt(call.name, input),
+    subagent_type: subagentType
+  };
+}
+
+function aliasPseudoToolCall(call, allowedToolNames = []) {
+  const pseudoName = pseudoToolBaseName(call.name);
+  const agentToolName = resolveAllowedToolName('Agent', allowedToolNames);
+  if (agentToolName && ['agent', 'explore', 'search', 'browse'].includes(pseudoName)) {
+    return {
+      ...call,
+      name: agentToolName,
+      input: normalizeAgentToolInput(call)
+    };
+  }
+  const taskToolName = resolveAllowedToolName('Task', allowedToolNames);
+  if (taskToolName && ['agent', 'explore', 'search', 'browse'].includes(pseudoName)) {
+    return {
+      ...call,
+      name: taskToolName,
+      input: {
+        description: pseudoToolDescription(call.name, call.input),
+        prompt: formatPseudoToolPrompt(call.name, call.input),
+        subagent_type: pseudoName === 'explore' ? 'Explore' : 'general-purpose'
+      }
+    };
+  }
+  return undefined;
+}
+
+function sanitizeToolInput(name, input) {
+  if (!isRecord(input)) {
+    return input;
+  }
+  const normalizedName = normalizeToolNameForLookup(name);
+  const sanitized = { ...input };
+  if (normalizedName === 'read') {
+    delete sanitized.lines;
+    delete sanitized.line;
+  }
+  if (normalizedName === 'agent') {
+    delete sanitized.callId;
+    delete sanitized.call_id;
+  }
+  return sanitized;
+}
+
+function normalizeToolCallForAllowedTools(call, allowedToolNames = []) {
+  const allowedName = resolveAllowedToolName(call.name, allowedToolNames);
+  if (allowedName) {
+    const normalized = { ...call, name: allowedName };
+    const input = normalizeToolNameForLookup(allowedName) === 'agent'
+      ? normalizeAgentToolInput(normalized)
+      : normalized.input;
+    return { ...normalized, input: sanitizeToolInput(allowedName, input) };
+  }
+  const aliased = aliasPseudoToolCall(call, allowedToolNames);
+  return aliased ? { ...aliased, input: sanitizeToolInput(aliased.name, aliased.input) } : undefined;
+}
+
+
+function extractJsonObjectAt(text, startIndex) {
+  let start = -1;
+  for (let i = startIndex; i < text.length; i += 1) {
+    if (text[i] === '{') {
+      start = i;
+      break;
+    }
+    if (!/\s/.test(text[i])) {
+      return undefined;
+    }
+  }
+  if (start < 0) {
+    return undefined;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{') {
+      depth += 1;
+    } else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+  return undefined;
+}
+
+function collectLooseToolAssignments(raw, calls) {
+  const text = String(raw ?? '');
+  const regex = /(?:to=([A-Za-z_][\w.-]*)\s+)?toolName\s*=\s*["']?([A-Za-z_][\w.-]*)["']?\s+args\s*=\s*/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const name = asString(match[2] || match[1]).trim();
+    if (!name) {
+      continue;
+    }
+    const jsonText = extractJsonObjectAt(text, regex.lastIndex);
+    if (!jsonText) {
+      continue;
+    }
+    const args = tryParseJson(jsonText);
+    calls.push({
+      id: `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      input: isRecord(args) ? args : jsonText
+    });
+  }
+}
+
+function parseToolCallsFromOutput(raw, allowedToolNames = []) {
   const calls = [];
   const parsedHarmony = parseHarmonyOutput(raw);
   if (parsedHarmony.isHarmony) {
@@ -831,20 +1067,28 @@ function parseToolCallsFromOutput(raw) {
       if (!isToolish) {
         continue;
       }
-      const parsedContent = tryParseJson(segment.content.trim());
-      if (!isRecord(parsedContent)) {
+      const parsed = tryParseJson(segment.content.trim());
+      const parsedContent = isRecord(parsed) ? parsed : {};
+      const rawName = asString(parsedContent.toolName || segment.recipient).trim();
+      if (!rawName) {
         continue;
       }
-      const name = asString(parsedContent.toolName || segment.recipient).trim();
-      if (!name) {
-        continue;
-      }
+      const input = isRecord(parsedContent.args)
+        ? {
+            ...parsedContent.args,
+            ...(typeof parsedContent.subagent_type === 'string' ? { subagent_type: parsedContent.subagent_type } : {}),
+            ...(typeof parsedContent.description === 'string' ? { description: parsedContent.description } : {}),
+            ...(typeof parsedContent.prompt === 'string' ? { prompt: parsedContent.prompt } : {})
+          }
+        : isRecord(parsed)
+          ? parsedContent
+          : segment.content.trim();
       calls.push({
         id:
           asString(parsedContent.callId).trim() ||
           `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-        name,
-        input: isRecord(parsedContent.args) ? parsedContent.args : parsedContent
+        name: rawName,
+        input
       });
     }
   }
@@ -857,33 +1101,61 @@ function parseToolCallsFromOutput(raw) {
   for (const candidate of extractJsonObjectRanges(raw)) {
     collectToolCalls(tryParseJson(candidate), calls);
   }
+  collectLooseToolAssignments(raw, calls);
   const seen = new Set();
-  return calls.filter(call => {
-    const key = `${call.name}|${JSON.stringify(call.input ?? {})}`;
+  const normalizedCalls = [];
+  for (const call of calls) {
+    const normalizedCall = normalizeToolCallForAllowedTools(call, allowedToolNames);
+    if (!normalizedCall) {
+      continue;
+    }
+    const key = `${normalizedCall.name}|${JSON.stringify(normalizedCall.input ?? {})}`;
     if (seen.has(key)) {
-      return false;
+      continue;
     }
     seen.add(key);
-    return true;
-  });
+    normalizedCalls.push(normalizedCall);
+  }
+  return normalizedCalls;
+}
+
+function stripDisplaySections(text) {
+  const normalized = text.trim();
+  const finalMatch = normalized.match(/^(?:#+\s*)?Final Response\s*\n([\s\S]*?)(?:\n\s*(?:#+\s*)?(?:Analysis|Tool Calls|Tool Results|Commentary)\s*\n[\s\S]*)?$/i);
+  return finalMatch?.[1]?.trim() || normalized;
+}
+
+function extractHarmonyFinalText(raw) {
+  const parsed = parseHarmonyOutput(raw);
+  if (!parsed.isHarmony) {
+    return undefined;
+  }
+  return parsed.messages
+    .filter(segment => asString(segment.channel).trim().split(/\s+/)[0] === 'final')
+    .map(segment => asString(segment.content))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function streamableText(raw) {
+  const finalText = extractHarmonyFinalText(raw);
+  if (typeof finalText === 'string') {
+    return finalText;
+  }
+  return stripDisplaySections(renderHarmonyForDisplay(raw).display);
 }
 
 function renderText(raw, toolCalls) {
   const rendered = renderHarmonyForDisplay(raw);
-  const stripDisplaySections = text => {
-    const normalized = text.trim();
-    const finalMatch = normalized.match(/^(?:#+\s*)?Final Response\s*\n([\s\S]*?)(?:\n\s*(?:#+\s*)?(?:Analysis|Tool Calls|Tool Results|Commentary)\s*\n[\s\S]*)?$/i);
-    return finalMatch?.[1]?.trim() || normalized;
-  };
   if (toolCalls.length > 0) {
-    const text = rendered.isHarmony ? rendered.finalText : raw;
+    const text = extractHarmonyFinalText(raw) ?? (rendered.isHarmony ? '' : raw);
     const trimmed = stripDisplaySections(text);
     if (!trimmed.startsWith('{') && !trimmed.startsWith('```json')) {
       return trimmed;
     }
     return '';
   }
-  return rendered.isHarmony ? rendered.finalText : stripDisplaySections(rendered.display);
+  return extractHarmonyFinalText(raw) ?? (rendered.isHarmony ? '' : stripDisplaySections(rendered.display));
 }
 
 function normalizeContent(content) {
@@ -929,13 +1201,24 @@ function normalizeSystem(system) {
   return '';
 }
 
+const NO_TOOLS_PROMPT = [
+  'No external tools are available in this API request.',
+  'Do not emit tool calls, function calls, Harmony recipient calls, or pseudo-tool invocations.',
+  'Do not call Explore, Agent, Read, Write, Edit, Bash, TodoWrite, WebFetch, or any other tool name.',
+  'Answer directly in final text and produce any requested artifact inline.'
+].join(' ');
+
 function formatToolsForPrompt(tools) {
   if (!Array.isArray(tools) || tools.length === 0) {
-    return '';
+    return NO_TOOLS_PROMPT;
   }
+  const toolNames = extractAvailableToolNames(tools);
   const lines = [
     'Tools are available. When you need a tool, respond with a tool call rather than final prose.',
-    'Tool call JSON shape: {"toolName":"name","callId":"optional-id","args":{...}}',
+    `Use only these exact tool names: ${toolNames.join(', ')}.`,
+    'For broad workspace exploration, use the exact Agent tool with subagent_type "Explore" when Agent is available; otherwise use the available file/search tools directly.',
+    'Do not invent separate Explore or Task tools unless those exact names appear above.',
+    'Tool call JSON shape: {"toolName":"exact_tool_name","callId":"optional-id","args":{...}}',
     'Available tools:'
   ];
   for (const tool of tools) {
@@ -1002,28 +1285,102 @@ function openAiToSpilliPayload(body) {
   };
 }
 
-async function runInference({ requestedModel, prompt, query }, config) {
+function stripEogMarkers(value) {
+  return String(value ?? '').replace(/\[EOG\]/g, '');
+}
+
+function createStreamChunkForwarder(onChunk) {
+  const marker = '[EOG]';
+  let ended = false;
+  let pending = '';
+  return {
+    onChunk(chunk) {
+      if (!onChunk || ended) {
+        return;
+      }
+      const text = String(chunk ?? '');
+      if (!text) {
+        return;
+      }
+      const combined = pending + text;
+      const eogIndex = combined.indexOf(marker);
+      if (eogIndex >= 0) {
+        const safeText = combined.slice(0, eogIndex);
+        if (safeText) {
+          onChunk(safeText);
+        }
+        pending = '';
+        ended = true;
+        return;
+      }
+      const keep = Math.min(marker.length - 1, combined.length);
+      const safeText = combined.slice(0, combined.length - keep);
+      pending = combined.slice(combined.length - keep);
+      if (safeText) {
+        onChunk(safeText);
+      }
+    },
+    flush() {
+      if (!onChunk || ended || !pending) {
+        return;
+      }
+      onChunk(pending);
+      pending = '';
+    }
+  };
+}
+
+function resourceCacheKey(resource) {
+  return `${resource.model}|${resource.scope ?? ''}|${resource.team ?? ''}`;
+}
+
+async function withResourceRunQueue(resource, callback) {
+  const key = resourceCacheKey(resource);
+  const previous = state.resourceRunQueues.get(key) ?? Promise.resolve();
+  let release;
+  const current = previous.catch(() => undefined).then(() => callback());
+  release = current.finally(() => {
+    if (state.resourceRunQueues.get(key) === release) {
+      state.resourceRunQueues.delete(key);
+    }
+  });
+  state.resourceRunQueues.set(key, release);
+  return current;
+}
+
+async function runInference({ requestedModel, prompt, query }, config, streamOptions = {}) {
   const resolvedModel = await resolveRequestedModel(requestedModel, config);
   const service = getService(config);
   const resource = { model: resolvedModel.uid, scope: config.scope };
   if (config.team) {
     resource.team = config.team;
   }
-  let session = config.reuseSessions
-    ? service.getOrCreateSession(resource, config.requestTimeoutMs)
-    : service.request(resource, config.requestTimeoutMs);
-  if (!session.isLive()) {
-    session = service.request(resource, config.requestTimeoutMs);
-  }
-  if (!session.isLive()) {
-    throw Object.assign(new Error('SpiLLI model session is not live.'), { statusCode: 503 });
-  }
-  const raw = await session.run({ prompt, query }, { timeoutMs: config.requestTimeoutMs });
-  return {
-    raw,
-    requestedModel: requestedModel || resolvedModel.displayName,
-    resolvedModel
-  };
+  const apiModelName = requestedModel || resolvedModel.displayName;
+  return withResourceRunQueue(resource, async () => {
+    let session = config.reuseSessions
+      ? service.getOrCreateSession(resource, config.requestTimeoutMs)
+      : service.request(resource, config.requestTimeoutMs);
+    if (!session.isLive()) {
+      session = service.request(resource, config.requestTimeoutMs);
+    }
+    if (!session.isLive()) {
+      throw Object.assign(new Error('SpiLLI model session is not live.'), { statusCode: 503 });
+    }
+    streamOptions.onStart?.({ requestedModel: apiModelName, resolvedModel });
+    const runOptions = { timeoutMs: config.requestTimeoutMs };
+    const streamForwarder =
+      typeof streamOptions.onChunk === 'function' ? createStreamChunkForwarder(streamOptions.onChunk) : undefined;
+    if (streamForwarder) {
+      runOptions.onChunk = chunk => streamForwarder.onChunk(chunk);
+    }
+    const raw = stripEogMarkers(await session.run({ prompt, query }, runOptions));
+    streamForwarder?.flush();
+    return {
+      raw,
+      requestedModel: apiModelName,
+      resolvedModel
+    };
+  });
 }
 
 function json(res, statusCode, payload, headers = {}) {
@@ -1084,8 +1441,109 @@ async function readBody(req) {
   return parsed;
 }
 
-function toAnthropicMessage({ id, model, raw }) {
-  const toolCalls = parseToolCallsFromOutput(raw);
+function sanitizeForLog(value, depth = 0) {
+  if (depth > 8) {
+    return '[Max log depth reached]';
+  }
+  if (typeof value === 'string') {
+    if (value.length <= MAX_LOG_STRING_LENGTH) {
+      return value;
+    }
+    return `${value.slice(0, MAX_LOG_STRING_LENGTH)}...[truncated ${value.length - MAX_LOG_STRING_LENGTH} chars]`;
+  }
+  if (Array.isArray(value)) {
+    return value.map(item => sanitizeForLog(item, depth + 1));
+  }
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  const output = {};
+  for (const [key, item] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase();
+    if (normalizedKey.includes('token') || normalizedKey.includes('authorization') || normalizedKey.includes('api_key')) {
+      output[key] = '[redacted]';
+      continue;
+    }
+    output[key] = sanitizeForLog(item, depth + 1);
+  }
+  return output;
+}
+
+function getRequestLogPath() {
+  return readEnv('SPILLI_BRIDGE_REQUEST_LOG_PATH', DEFAULT_REQUEST_LOG_PATH);
+}
+
+async function appendRequestLog(entry) {
+  const logPath = expandHome(getRequestLogPath());
+  try {
+    await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
+    await fs.promises.appendFile(logPath, `${JSON.stringify(sanitizeForLog(entry))}
+`, 'utf8');
+  } catch (err) {
+    console.warn(`Failed to write SpiLLI API bridge request log: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function logInferenceRequest(kind, req, body, payload, extra = {}) {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+  await appendRequestLog({
+    timestamp: new Date().toISOString(),
+    kind,
+    method: req.method,
+    path: url.pathname,
+    query: Object.fromEntries(url.searchParams.entries()),
+    client: {
+      user_agent: asString(req.headers['user-agent']) || null,
+      anthropic_version: asString(req.headers['anthropic-version']) || null,
+      anthropic_beta: asString(req.headers['anthropic-beta']) || null
+    },
+    request: {
+      model: asString(body.model) || null,
+      stream: body.stream === true,
+      system: body.system ?? null,
+      tools: Array.isArray(body.tools) ? body.tools : [],
+      tool_names: extractAvailableToolNames(body.tools),
+      messages: Array.isArray(body.messages) ? body.messages : []
+    },
+    bridge: {
+      requestedModel: payload.requestedModel,
+      promptLength: payload.prompt.length,
+      queryLength: payload.query.length,
+      prompt: payload.prompt,
+      query: payload.query,
+      ...extra
+    }
+  });
+}
+
+function harmonySummary(raw) {
+  const parsed = parseHarmonyOutput(raw);
+  if (!parsed.isHarmony) {
+    return { isHarmony: false };
+  }
+  return {
+    isHarmony: true,
+    messages: parsed.messages.map(message => ({
+      role: message.role,
+      channel: message.channel,
+      recipient: message.recipient,
+      terminator: message.terminator,
+      content: message.content
+    })),
+    remainder: parsed.remainder
+  };
+}
+
+async function logInferenceResponse(kind, data) {
+  await appendRequestLog({
+    timestamp: new Date().toISOString(),
+    kind,
+    response: data
+  });
+}
+
+function toAnthropicMessage({ id, model, raw, toolsEnabled = false, allowedToolNames = [] }) {
+  const toolCalls = toolsEnabled ? parseToolCallsFromOutput(raw, allowedToolNames) : [];
   const text = renderText(raw, toolCalls);
   const content = [];
   if (text) {
@@ -1114,6 +1572,63 @@ function toAnthropicMessage({ id, model, raw }) {
   };
 }
 
+function requestHasTools(body) {
+  return extractAvailableToolNames(body?.tools).length > 0;
+}
+
+function messageHasOutput(message) {
+  return Array.isArray(message?.content) && message.content.length > 0;
+}
+
+function shouldRetryEmptyAnthropicTurn(message, raw) {
+  if (messageHasOutput(message)) {
+    return false;
+  }
+  const parsed = parseHarmonyOutput(raw);
+  return parsed.isHarmony || Boolean(String(raw || '').trim());
+}
+
+function buildAnthropicRetryPayload(payload, allowedToolNames) {
+  const toolList = allowedToolNames.length ? allowedToolNames.join(', ') : 'none';
+  const repairPrompt = [
+    'Bridge retry instruction: your previous response could not be converted into a valid Anthropic assistant message.',
+    'Do not return analysis-only text.',
+    `Available exact tool names: ${toolList}.`,
+    'If you need workspace search or exploration and Agent is available, emit exactly one tool call in this JSON shape:',
+    '{"toolName":"Agent","args":{"description":"3-5 word task summary","prompt":"specific search/read task with paths and filenames","subagent_type":"Explore"}}',
+    'If no tool is needed, answer directly in the final channel.'
+  ].join('\n');
+  return {
+    ...payload,
+    prompt: [payload.prompt, repairPrompt].filter(Boolean).join('\n\n')
+  };
+}
+
+async function runAnthropicInferenceWithRetry(payload, config, options) {
+  let result = await runInference(payload, config, options?.streamOptions ?? {});
+  let message = toAnthropicMessage({
+    id: options.id,
+    model: result.requestedModel,
+    raw: result.raw,
+    toolsEnabled: options.toolsEnabled,
+    allowedToolNames: options.allowedToolNames
+  });
+  let retried = false;
+  if (shouldRetryEmptyAnthropicTurn(message, result.raw)) {
+    retried = true;
+    const retryPayload = buildAnthropicRetryPayload(payload, options.allowedToolNames);
+    result = await runInference(retryPayload, config);
+    message = toAnthropicMessage({
+      id: options.id,
+      model: result.requestedModel,
+      raw: result.raw,
+      toolsEnabled: options.toolsEnabled,
+      allowedToolNames: options.allowedToolNames
+    });
+  }
+  return { result, message, retried };
+}
+
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -1122,7 +1637,10 @@ function writeSse(res, event, data) {
 async function handleAnthropicMessages(req, res, config) {
   const body = await readBody(req);
   const payload = anthropicToSpilliPayload(body);
+  const allowedToolNames = extractAvailableToolNames(body.tools);
+  const toolsEnabled = allowedToolNames.length > 0;
   const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  await logInferenceRequest('anthropic.messages', req, body, payload, { requestId: id, allowedToolNames, toolsEnabled });
   if (body.stream === true) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -1131,42 +1649,107 @@ async function handleAnthropicMessages(req, res, config) {
       ...corsHeaders()
     });
     const ping = setInterval(() => writeSse(res, 'ping', { type: 'ping' }), 15_000);
-    try {
-      const result = await runInference(payload, config);
-      const message = toAnthropicMessage({ id, model: result.requestedModel, raw: result.raw });
-      writeSse(res, 'message_start', {
-        type: 'message_start',
-        message: { ...message, content: [], stop_reason: null, stop_sequence: null }
+    let textBlockStarted = false;
+    let textBlockStopped = false;
+    let streamedText = '';
+    let outputChars = 0;
+    const startTextBlock = () => {
+      if (textBlockStarted) {
+        return;
+      }
+      textBlockStarted = true;
+      writeSse(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'text', text: '' }
       });
-      message.content.forEach((block, index) => {
-        const emptyBlock =
-          block.type === 'text'
-            ? { type: 'text', text: '' }
-            : { type: 'tool_use', id: block.id, name: block.name, input: {} };
+    };
+    const writeTextDelta = text => {
+      if (!text) {
+        return;
+      }
+      startTextBlock();
+      outputChars += text.length;
+      writeSse(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text }
+      });
+    };
+    const stopTextBlock = () => {
+      if (!textBlockStarted || textBlockStopped) {
+        return;
+      }
+      textBlockStopped = true;
+      writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+    };
+    try {
+      const { result, message, retried } = await runAnthropicInferenceWithRetry(payload, config, {
+        id,
+        toolsEnabled,
+        allowedToolNames,
+        streamOptions: {
+          onStart: ({ requestedModel }) => {
+            writeSse(res, 'message_start', {
+              type: 'message_start',
+              message: {
+                id,
+                type: 'message',
+                role: 'assistant',
+                model: requestedModel,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 0, output_tokens: 0 }
+              }
+            });
+          }
+        }
+      });
+      await logInferenceResponse('anthropic.messages.response', {
+        id,
+        stream: true,
+        retried,
+        model: result.requestedModel,
+        allowedToolNames,
+        raw: result.raw,
+        harmony: harmonySummary(result.raw),
+        parsedToolCalls: parseToolCallsFromOutput(result.raw, allowedToolNames),
+        emittedContent: message.content,
+        stopReason: message.stop_reason
+      });
+      const finalTextBlock = message.content.find(block => block.type === 'text');
+      if (finalTextBlock?.text && finalTextBlock.text.startsWith(streamedText)) {
+        const delta = finalTextBlock.text.slice(streamedText.length);
+        streamedText = finalTextBlock.text;
+        writeTextDelta(delta);
+      } else if (outputChars === 0 && finalTextBlock?.text) {
+        streamedText = finalTextBlock.text;
+        writeTextDelta(finalTextBlock.text);
+      }
+      stopTextBlock();
+      let nextIndex = textBlockStarted ? 1 : 0;
+      for (const block of message.content) {
+        if (block.type !== 'tool_use') {
+          continue;
+        }
+        const index = nextIndex++;
         writeSse(res, 'content_block_start', {
           type: 'content_block_start',
           index,
-          content_block: emptyBlock
+          content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} }
         });
-        if (block.type === 'text') {
-          writeSse(res, 'content_block_delta', {
-            type: 'content_block_delta',
-            index,
-            delta: { type: 'text_delta', text: block.text }
-          });
-        } else if (block.type === 'tool_use') {
-          writeSse(res, 'content_block_delta', {
-            type: 'content_block_delta',
-            index,
-            delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input ?? {}) }
-          });
-        }
+        writeSse(res, 'content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input ?? {}) }
+        });
         writeSse(res, 'content_block_stop', { type: 'content_block_stop', index });
-      });
+      }
       writeSse(res, 'message_delta', {
         type: 'message_delta',
         delta: { stop_reason: message.stop_reason, stop_sequence: null },
-        usage: message.usage
+        usage: { input_tokens: 0, output_tokens: Math.max(1, Math.ceil(Math.max(outputChars, result.raw.length) / 4)) }
       });
       writeSse(res, 'message_stop', { type: 'message_stop' });
       res.end();
@@ -1181,20 +1764,37 @@ async function handleAnthropicMessages(req, res, config) {
     }
     return;
   }
-  const result = await runInference(payload, config);
-  json(res, 200, toAnthropicMessage({ id, model: result.requestedModel, raw: result.raw }));
+  const { result, message, retried } = await runAnthropicInferenceWithRetry(payload, config, {
+    id,
+    toolsEnabled,
+    allowedToolNames
+  });
+  await logInferenceResponse('anthropic.messages.response', {
+    id,
+    stream: false,
+    retried,
+    model: result.requestedModel,
+    allowedToolNames,
+    raw: result.raw,
+    harmony: harmonySummary(result.raw),
+    parsedToolCalls: parseToolCallsFromOutput(result.raw, allowedToolNames),
+    emittedContent: message.content,
+    stopReason: message.stop_reason
+  });
+  json(res, 200, message);
 }
 
 async function handleAnthropicCountTokens(req, res, config) {
   const body = await readBody(req);
   const payload = anthropicToSpilliPayload(body);
+  await logInferenceRequest('anthropic.count_tokens', req, body, payload, { requestId: `tok_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}` });
   json(res, 200, {
     input_tokens: estimateTokens(`${payload.prompt}\n\n${payload.query}`)
   });
 }
 
-function toOpenAiChatCompletion({ id, model, raw }) {
-  const toolCalls = parseToolCallsFromOutput(raw);
+function toOpenAiChatCompletion({ id, model, raw, toolsEnabled = false, allowedToolNames = [] }) {
+  const toolCalls = toolsEnabled ? parseToolCallsFromOutput(raw, allowedToolNames) : [];
   const text = renderText(raw, toolCalls);
   return {
     id,
@@ -1231,8 +1831,10 @@ async function handleOpenAiChatCompletions(req, res, config) {
   const body = await readBody(req);
   const payload = openAiToSpilliPayload(body);
   const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-  const result = await runInference(payload, config);
-  const completion = toOpenAiChatCompletion({ id, model: result.requestedModel, raw: result.raw });
+  const allowedToolNames = extractAvailableToolNames(body.tools);
+  const toolsEnabled = allowedToolNames.length > 0;
+  await logInferenceRequest('openai.chat_completions', req, body, payload, { requestId: id, allowedToolNames, toolsEnabled });
+  const created = Math.floor(Date.now() / 1000);
   if (body.stream === true) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -1240,34 +1842,125 @@ async function handleOpenAiChatCompletions(req, res, config) {
       connection: 'keep-alive',
       ...corsHeaders()
     });
-    const choice = completion.choices[0];
-    res.write(`data: ${JSON.stringify({
-      id,
-      object: 'chat.completion.chunk',
-      created: completion.created,
-      model: result.requestedModel,
-      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-    })}\n\n`);
-    if (choice.message.content) {
+    let streamModel = payload.requestedModel;
+    let rawForStream = '';
+    let streamedText = '';
+    try {
+      const result = await runInference(payload, config, {
+        onStart: ({ requestedModel }) => {
+          streamModel = requestedModel;
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model: requestedModel,
+            choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+          })}\n\n`);
+        },
+        onChunk: chunk => {
+          rawForStream += chunk;
+          const nextText = streamableText(rawForStream);
+          if (!nextText || !nextText.startsWith(streamedText)) {
+            return;
+          }
+          const delta = nextText.slice(streamedText.length);
+          streamedText = nextText;
+          if (!delta) {
+            return;
+          }
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model: streamModel,
+            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+          })}\n\n`);
+        }
+      });
+      const completion = toOpenAiChatCompletion({ id, model: result.requestedModel, raw: result.raw, toolsEnabled, allowedToolNames });
+      await logInferenceResponse('openai.chat_completions.response', {
+        id,
+        stream: true,
+        model: result.requestedModel,
+        allowedToolNames,
+        raw: result.raw,
+        harmony: harmonySummary(result.raw),
+        parsedToolCalls: parseToolCallsFromOutput(result.raw, allowedToolNames),
+        emittedChoice: completion.choices[0]
+      });
+      const choice = completion.choices[0];
+      if (choice.message.content && choice.message.content.startsWith(streamedText)) {
+        const delta = choice.message.content.slice(streamedText.length);
+        streamedText = choice.message.content;
+        if (delta) {
+          res.write(`data: ${JSON.stringify({
+            id,
+            object: 'chat.completion.chunk',
+            created,
+            model: result.requestedModel,
+            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+          })}\n\n`);
+        }
+      } else if (!streamedText && choice.message.content) {
+        streamedText = choice.message.content;
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model: result.requestedModel,
+          choices: [{ index: 0, delta: { content: choice.message.content }, finish_reason: null }]
+        })}\n\n`);
+      }
+      for (const toolCall of choice.message.tool_calls ?? []) {
+        res.write(`data: ${JSON.stringify({
+          id,
+          object: 'chat.completion.chunk',
+          created,
+          model: result.requestedModel,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: 0,
+                id: toolCall.id,
+                type: 'function',
+                function: toolCall.function
+              }]
+            },
+            finish_reason: null
+          }]
+        })}\n\n`);
+      }
       res.write(`data: ${JSON.stringify({
         id,
         object: 'chat.completion.chunk',
-        created: completion.created,
+        created,
         model: result.requestedModel,
-        choices: [{ index: 0, delta: { content: choice.message.content }, finish_reason: null }]
+        choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason }]
       })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+    } catch (err) {
+      res.write(`data: ${JSON.stringify({
+        error: { type: 'api_error', message: err instanceof Error ? err.message : String(err) }
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
     }
-    res.write(`data: ${JSON.stringify({
-      id,
-      object: 'chat.completion.chunk',
-      created: completion.created,
-      model: result.requestedModel,
-      choices: [{ index: 0, delta: {}, finish_reason: choice.finish_reason }]
-    })}\n\n`);
-    res.write('data: [DONE]\n\n');
-    res.end();
     return;
   }
+  const result = await runInference(payload, config);
+  const completion = toOpenAiChatCompletion({ id, model: result.requestedModel, raw: result.raw, toolsEnabled, allowedToolNames });
+  await logInferenceResponse('openai.chat_completions.response', {
+    id,
+    stream: false,
+    model: result.requestedModel,
+    allowedToolNames,
+    raw: result.raw,
+    harmony: harmonySummary(result.raw),
+    parsedToolCalls: parseToolCallsFromOutput(result.raw, allowedToolNames),
+    emittedChoice: completion.choices[0]
+  });
   json(res, 200, completion);
 }
 
@@ -1401,4 +2094,5 @@ loadEnvFiles();
 const config = getConfig();
 server.listen(config.port, config.host, () => {
   console.log(`SpiLLI API bridge listening at http://${config.host}:${config.port}`);
+  console.log(`SpiLLI API bridge request log: ${expandHome(getRequestLogPath())}`);
 });

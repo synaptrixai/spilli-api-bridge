@@ -133,7 +133,7 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_BRIDGE_AUTH_TOKEN`: optional local bearer/API key.
 - `SPILLI_BRIDGE_REQUEST_TIMEOUT_MS`: per-request SpiLLI timeout, default `600000`.
 - `SPILLI_BRIDGE_MODEL_CACHE_TTL_MS`: live model inventory cache TTL, default `30000`.
-- `SPILLI_BRIDGE_REUSE_SESSIONS`: set to `0` to force a fresh SpiLLI resource request for every inference request. Defaults to `1`, reusing acquired resource sessions by model/scope.
+- `SPILLI_BRIDGE_REUSE_SESSIONS`: set to `0` to force a fresh SpiLLI resource request for troubleshooting. Defaults to `1`, reusing the acquired network resource/session by model/scope while keeping chat history in each request payload.
 - `SPILLI_BRIDGE_NATIVE_CACHE_DIR`: optional native binary cache directory.
 
 ## Dynamic Models
@@ -165,6 +165,10 @@ curl "http://localhost:8888/v1/models?refresh=true"
 ```
 
 Inference requests may pass either the friendly model id returned from `/v1/models` or the raw UID. The bridge resolves the friendly name back to the UID before calling `SpilliService`.
+
+Both Anthropic-compatible `/v1/messages` and OpenAI-compatible `/v1/chat/completions` support `stream: true`. Streaming forwards SpiLLI SDK chunks as SSE deltas and treats `[EOG]` as the end-of-generation marker instead of returning it to clients.
+
+The bridge logs inbound inference requests and converted SpiLLI prompt/query payloads as JSONL at `~/.spilli/spilli-api-bridge-requests.jsonl`. Override with `SPILLI_BRIDGE_REQUEST_LOG_PATH` when needed. Auth tokens are not logged, and very large strings are truncated.
 
 ## Smoke Test
 

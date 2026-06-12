@@ -8,7 +8,7 @@ The bridge has three separate responsibilities:
 
 1. Discover live SpiLLI host inventory and expose model display names through `/v1/models`.
 2. Resolve API model names back to SpiLLI model UIDs.
-3. Forward each inference request to an acquired SpiLLI resource session with a self-contained prompt/query payload.
+3. Forward each inference request to a shared SpiLLI resource session with a self-contained prompt/query payload.
 
 Keep those concepts separate. Model inventory and resource allocation are not chat memory.
 
@@ -53,21 +53,19 @@ Inference may receive either the friendly API name or the UID. The bridge should
 
 ## SpiLLI SDK Session Semantics
 
-Treat `SpilliSession` as an acquired network resource for a model/scope/team, not as a chat conversation.
+Treat `SpilliSession` as an acquired network resource for a model/scope/team, not as a chat conversation. The bridge should reuse it for the same resource so multiple chat sessions do not create duplicate network connections.
 
 Do:
 
-- Reuse `service.getOrCreateSession({ model: uid, scope, team })` for the same resource.
+- Use `service.getOrCreateSession({ model: uid, scope, team }, timeoutMs)` for normal inference.
 - Send a complete prompt/query object on each `session.run({ prompt, query }, ...)` call.
 - Keep API/chat history outside the SpiLLI resource session and include it in prompt/query when needed.
+- Serialize `session.run()` calls per shared resource session to avoid overlapping native stream callbacks for the same model connection.
 
 Do not:
 
-- Create a new resource request for every inference unless explicitly troubleshooting resource acquisition.
 - Use one SDK resource session as the source of chat memory.
 - Use `clientId` in `session.run()` for chat ids or request ids. It is reserved for SDK/internal behavior.
-
-The bridge supports `SPILLI_BRIDGE_REUSE_SESSIONS=0` only as a troubleshooting escape hatch. Normal operation should reuse acquired resource sessions.
 
 ## Anthropic/OpenAI Compatibility
 

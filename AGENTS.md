@@ -4,12 +4,10 @@ You are working in `spilli-api-bridge`, a local Anthropic/OpenAI-compatible brid
 
 ## Non-Negotiable Semantics
 
-- A SpiLLI SDK `SpilliSession` is an acquired network resource/session for a model/scope/team.
-- It is not a chat conversation.
-- Do not open a new SpiLLI resource request per chat turn unless explicitly requested for troubleshooting.
+- A SpiLLI SDK `SpilliSession` is an acquired network resource/session for a model/scope/team. It should be shared for the same resource so the bridge does not create duplicate network connections.
+- It is not a chat conversation. Chat/client history belongs in the complete `{ prompt, query }` payload supplied to each `session.run()` call.
 - Do not use `clientId` in `session.run()` for request ids, chat ids, or tracing. It is reserved for SDK/internal behavior.
-- Each inference request must send a complete `{ prompt, query }` payload to `session.run()`.
-- Chat/client history belongs in the prompt/query payload, not in the resource allocation.
+- Claude Code can send overlapping requests for the same model, so serialize `session.run()` calls per shared resource session unless the SDK explicitly documents concurrent runs as safe.
 
 ## Correct SDK Pattern
 
