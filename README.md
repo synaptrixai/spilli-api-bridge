@@ -84,9 +84,6 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_KEY_PATH`: PEM file or directory, default `~/.spilli`, matching the VS Code extension.
   When this points to a directory, the bridge uses the same highest-tier priority as the extension:
   `SpiLLI_Enterprise.pem`, `SpiLLI_Team.pem`, `SpiLLI_Personal.pem`, then `SpiLLI_Community.pem`.
-- `SPILLI_BRIDGE_SCOPE`: SpiLLI model inventory scope, default `private`.
-  Valid values are `public`, `private`, `team`, `team.<name>`, and `enterprise`.
-  `community` is accepted as an alias for `public`; community is a PEM/subscription tier, not a host model visibility scope.
 - `SPILLI_BRIDGE_TEAM`: optional team name for team-scoped requests.
 - `SPILLI_BRIDGE_AUTH_TOKEN`: optional local bearer/API key.
 - `SPILLI_BRIDGE_REQUEST_TIMEOUT_MS`: per-request SpiLLI timeout, default `600000`.
@@ -96,7 +93,17 @@ Copy `.env.example` into your process manager or shell environment.
 
 ## Dynamic Models
 
-`GET /v1/models` fetches the same host inventory used by the VS Code extension for the configured scope. It returns the friendly display name as the API model id and includes the underlying SpiLLI UID as `uid`.
+`GET /v1/models` fetches the same host inventory used by the VS Code extension for the active model scope. It returns the friendly display name as the API model id and includes the underlying SpiLLI UID as `uid`.
+
+The bridge starts with `public` model scope. Change it at runtime with:
+
+```sh
+curl -X POST http://localhost:8888/v1/scope \
+  -H 'content-type: application/json' \
+  -d '{"scope":"public"}'
+```
+
+Valid scope values are `public`, `private`, `team`, `team.<name>`, and `enterprise`. `community` is accepted as an alias for `public`.
 
 You can force-refresh the model inventory cache on demand:
 

@@ -35,7 +35,7 @@ Backend inventory requests must send the resolved PEM content as both `key` and 
 
 Inventory comes from the hardcoded public SpiLLI backend endpoints in `src/server.mjs`. Do not expose these as public release environment variables unless there is a product requirement to support alternate deployments.
 
-`SPILLI_BRIDGE_SCOPE` is a model visibility scope, not a subscription tier. Valid values:
+Model scope is set at runtime with `POST /v1/scope`, not with an environment variable. It is a model visibility scope, not a subscription tier. Valid values:
 
 ```text
 public
@@ -45,7 +45,7 @@ team.<name>
 enterprise
 ```
 
-`community` is accepted as an alias for `public` because users often think in subscription tiers.
+`community` is accepted as an alias for `public` because users often think in subscription tiers. Changing scope clears the model inventory cache; the next `/v1/models` or inference request discovers models for the active scope.
 
 `GET /v1/models` returns the API-facing friendly name as `id` and includes the underlying SpiLLI UID as `uid`.
 

@@ -30,7 +30,8 @@ const state = {
   keyPath: undefined,
   modelCache: undefined,
   pendingModelFetch: undefined,
-  loadedEnvFiles: []
+  loadedEnvFiles: [],
+  modelScope: 'public'
 };
 
 
@@ -96,10 +97,10 @@ function expandHome(input) {
   return input;
 }
 
-function normalizeConfiguredScope(scope) {
+function normalizeScopeInput(scope) {
   const normalized = scope.trim().toLowerCase();
   if (!normalized) {
-    return 'private';
+    return undefined;
   }
   if (normalized === 'community' || normalized === 'commmunity') {
     return 'public';
@@ -116,8 +117,16 @@ function normalizeConfiguredScope(scope) {
   if (normalized.startsWith('team.') && normalized.slice('team.'.length).trim()) {
     return normalized;
   }
+  return undefined;
+}
+
+function normalizeConfiguredScope(scope) {
+  const normalized = normalizeScopeInput(scope);
+  if (normalized) {
+    return normalized;
+  }
   console.warn(
-    `Unknown SPILLI_BRIDGE_SCOPE="${scope}". Expected public, private, team, team.<name>, or enterprise. Falling back to private.`
+    `Unknown model scope "${scope}". Expected public, private, team, team.<name>, or enterprise. Falling back to private.`
   );
   return 'private';
 }
@@ -125,14 +134,12 @@ function normalizeConfiguredScope(scope) {
 function getConfig() {
   const requestTimeoutMs = Number.parseInt(readEnv('SPILLI_BRIDGE_REQUEST_TIMEOUT_MS'), 10);
   const modelCacheTtlMs = Number.parseInt(readEnv('SPILLI_BRIDGE_MODEL_CACHE_TTL_MS'), 10);
-  const rawScope = readEnv('SPILLI_BRIDGE_SCOPE', 'private');
-  const scope = normalizeConfiguredScope(rawScope);
+  const scope = normalizeConfiguredScope(state.modelScope);
   return {
     host: readEnv('SPILLI_BRIDGE_HOST', '127.0.0.1'),
     port: Number.parseInt(readEnv('SPILLI_BRIDGE_PORT'), 10) || DEFAULT_PORT,
     keyPath: expandHome(readEnv('SPILLI_KEY_PATH', DEFAULT_SPILLI_KEY_PATH)),
     scope,
-    rawScope,
     team: readEnv('SPILLI_BRIDGE_TEAM'),
     authToken: readEnv('SPILLI_BRIDGE_AUTH_TOKEN'),
     requestTimeoutMs: Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0 ? requestTimeoutMs : DEFAULT_TIMEOUT_MS,
@@ -1286,6 +1293,44 @@ async function handleModels(req, res, config) {
   });
 }
 
+
+function scopePayload(config, message) {
+  return {
+    ok: true,
+    scope: config.scope,
+    team: config.team || null,
+    valid_scopes: ['public', 'private', 'team', 'team.<name>', 'enterprise'],
+    message
+  };
+}
+
+async function handleScope(req, res, config) {
+  if (req.method === 'GET') {
+    json(res, 200, scopePayload(config));
+    return;
+  }
+  if (req.method !== 'POST') {
+    json(res, 405, { error: { type: 'invalid_request_error', message: 'Method not allowed.' } });
+    return;
+  }
+  const body = await readBody(req);
+  const requested = asString(body.scope || body.model_scope || body.visibility).trim();
+  const normalized = normalizeScopeInput(requested);
+  if (!normalized) {
+    json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        message: 'Scope must be one of public, private, team, team.<name>, enterprise, community, or personal.'
+      }
+    });
+    return;
+  }
+  state.modelScope = normalized;
+  state.modelCache = undefined;
+  state.pendingModelFetch = undefined;
+  json(res, 200, scopePayload(getConfig(), `Model scope set to "${normalized}".`));
+}
+
 async function route(req, res) {
   const config = getConfig();
   const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
@@ -1304,8 +1349,13 @@ async function route(req, res) {
       service: 'spilli-api-bridge',
       scope: config.scope,
       team: config.team || null,
+      scope_configurable: true,
       dynamic_models: true
     });
+    return;
+  }
+  if ((req.method === 'GET' || req.method === 'POST') && (url.pathname === '/v1/scope' || url.pathname === '/scope')) {
+    await handleScope(req, res, config);
     return;
   }
   if (req.method === 'GET' && (url.pathname === '/v1/models' || url.pathname === '/models')) {
