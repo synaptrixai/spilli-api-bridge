@@ -50,6 +50,51 @@ Host processes can then use:
 export ANTHROPIC_BASE_URL="http://localhost:8888"
 ```
 
+### Use The Published Image
+
+The public image is published to GitHub Container Registry:
+
+```text
+ghcr.io/synaptrixai/spilli-api-bridge:latest
+```
+
+Use it from another project's Compose file:
+
+```yaml
+services:
+  spilli-api-bridge:
+    image: ghcr.io/synaptrixai/spilli-api-bridge:latest
+    restart: unless-stopped
+    ports:
+      - "${SPILLI_BRIDGE_PORT:-8888}:8888"
+    environment:
+      SPILLI_BRIDGE_HOST: 0.0.0.0
+      SPILLI_BRIDGE_PORT: 8888
+      SPILLI_KEY_PATH: /home/node/.spilli
+      SPILLI_BRIDGE_TEAM: ${SPILLI_BRIDGE_TEAM:-}
+      SPILLI_BRIDGE_AUTH_TOKEN: ${SPILLI_BRIDGE_AUTH_TOKEN:-}
+      SPILLI_BRIDGE_REQUEST_TIMEOUT_MS: ${SPILLI_BRIDGE_REQUEST_TIMEOUT_MS:-600000}
+      SPILLI_BRIDGE_MODEL_CACHE_TTL_MS: ${SPILLI_BRIDGE_MODEL_CACHE_TTL_MS:-30000}
+      SPILLI_BRIDGE_REUSE_SESSIONS: ${SPILLI_BRIDGE_REUSE_SESSIONS:-1}
+    volumes:
+      - ${SPILLI_PEM_DIR:-${HOME}/.spilli}:/home/node/.spilli:ro
+```
+
+For a pinned release, replace `latest` with a version tag such as `v0.1.0`.
+
+### Publish A Release
+
+Images are built for `linux/amd64` and `linux/arm64` by GitHub Actions. Pull requests build the image without publishing it. Pushes to `main`, version tags, and manual workflow runs publish to GHCR.
+
+To publish a versioned image:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+After the first publish, make the GHCR package public in GitHub under the repository's Packages settings if it is not already public.
+
 ## Claude Code
 
 ```sh

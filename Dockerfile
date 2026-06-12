@@ -4,6 +4,11 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+LABEL org.opencontainers.image.title="SpiLLI API Bridge"
+LABEL org.opencontainers.image.description="Anthropic/OpenAI-compatible API bridge for the SpiLLI SDK"
+LABEL org.opencontainers.image.source="https://github.com/synaptrixai/spilli-api-bridge"
+LABEL org.opencontainers.image.licenses="MIT"
+
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
