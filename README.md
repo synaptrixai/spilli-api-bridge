@@ -84,7 +84,7 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_KEY_PATH`: PEM file or directory, default `~/.spilli`, matching the VS Code extension.
   When this points to a directory, the bridge uses the same highest-tier priority as the extension:
   `SpiLLI_Enterprise.pem`, `SpiLLI_Team.pem`, `SpiLLI_Personal.pem`, then `SpiLLI_Community.pem`.
-- `SPILLI_BRIDGE_TEAM`: optional team name for team-scoped requests.
+- `SPILLI_BRIDGE_TEAM`: optional fallback team name for team-scoped requests. Runtime `POST /v1/scope` with `team_name` is preferred.
 - `SPILLI_BRIDGE_AUTH_TOKEN`: optional local bearer/API key.
 - `SPILLI_BRIDGE_REQUEST_TIMEOUT_MS`: per-request SpiLLI timeout, default `600000`.
 - `SPILLI_BRIDGE_MODEL_CACHE_TTL_MS`: live model inventory cache TTL, default `30000`.
@@ -101,6 +101,14 @@ The bridge starts with `public` model scope. Change it at runtime with:
 curl -X POST http://localhost:8888/v1/scope \
   -H 'content-type: application/json' \
   -d '{"scope":"public"}'
+```
+
+For team-scoped models, include `team_name`:
+
+```sh
+curl -X POST http://localhost:8888/v1/scope \
+  -H 'content-type: application/json' \
+  -d '{"scope":"team","team_name":"my-team"}'
 ```
 
 Valid scope values are `public`, `private`, `team`, `team.<name>`, and `enterprise`. `community` is accepted as an alias for `public`.

@@ -31,7 +31,8 @@ const state = {
   modelCache: undefined,
   pendingModelFetch: undefined,
   loadedEnvFiles: [],
-  modelScope: 'public'
+  modelScope: 'public',
+  modelTeam: undefined
 };
 
 
@@ -140,7 +141,7 @@ function getConfig() {
     port: Number.parseInt(readEnv('SPILLI_BRIDGE_PORT'), 10) || DEFAULT_PORT,
     keyPath: expandHome(readEnv('SPILLI_KEY_PATH', DEFAULT_SPILLI_KEY_PATH)),
     scope,
-    team: readEnv('SPILLI_BRIDGE_TEAM'),
+    team: state.modelTeam ?? readEnv('SPILLI_BRIDGE_TEAM'),
     authToken: readEnv('SPILLI_BRIDGE_AUTH_TOKEN'),
     requestTimeoutMs: Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0 ? requestTimeoutMs : DEFAULT_TIMEOUT_MS,
     modelCacheTtlMs:
@@ -1299,6 +1300,7 @@ function scopePayload(config, message) {
     ok: true,
     scope: config.scope,
     team: config.team || null,
+    team_name: config.team || null,
     valid_scopes: ['public', 'private', 'team', 'team.<name>', 'enterprise'],
     message
   };
@@ -1325,7 +1327,20 @@ async function handleScope(req, res, config) {
     });
     return;
   }
+  const requestedTeamName = asString(body.team_name || body.teamName || body.team).trim();
+  const scopeTeamName = getTeamNameFromScope(normalized);
+  const effectiveTeamName = scopeTeamName || requestedTeamName || config.team;
+  if (getBaseScope(normalized) === 'team' && !effectiveTeamName) {
+    json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        message: 'team_name is required when scope is "team".'
+      }
+    });
+    return;
+  }
   state.modelScope = normalized;
+  state.modelTeam = getBaseScope(normalized) === 'team' ? effectiveTeamName : undefined;
   state.modelCache = undefined;
   state.pendingModelFetch = undefined;
   json(res, 200, scopePayload(getConfig(), `Model scope set to "${normalized}".`));
@@ -1349,6 +1364,7 @@ async function route(req, res) {
       service: 'spilli-api-bridge',
       scope: config.scope,
       team: config.team || null,
+      team_name: config.team || null,
       scope_configurable: true,
       dynamic_models: true
     });

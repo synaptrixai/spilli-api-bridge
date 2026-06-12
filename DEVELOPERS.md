@@ -45,7 +45,7 @@ team.<name>
 enterprise
 ```
 
-`community` is accepted as an alias for `public` because users often think in subscription tiers. Changing scope clears the model inventory cache; the next `/v1/models` or inference request discovers models for the active scope.
+`community` is accepted as an alias for `public` because users often think in subscription tiers. Changing scope clears the model inventory cache; the next `/v1/models` or inference request discovers models for the active scope. When using `scope: "team"`, callers must also provide `team_name`; the bridge passes that value through to SpiLLI SDK resource requests as `team`.
 
 `GET /v1/models` returns the API-facing friendly name as `id` and includes the underlying SpiLLI UID as `uid`.
 
