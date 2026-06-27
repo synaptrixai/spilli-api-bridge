@@ -56,9 +56,9 @@ Inventory calls must use mTLS with the PEM content as both `key` and `cert`.
 
 ## API Output Rules
 
-- Never return Harmony analysis text to API clients.
-- Return final assistant text only.
-- Translate raw tool-call output into Anthropic/OpenAI tool-call objects.
+- `SPILLI_BRIDGE_RESPONSE_MODE=raw` is the default. Return SpiLLI model text as assistant text and do not infer tool calls.
+- `SPILLI_BRIDGE_RESPONSE_MODE=compat` preserves parser-based Harmony/JSON conversion into Anthropic/OpenAI tool-call objects.
+- Never return Harmony analysis text to API clients in `compat` mode.
 - Keep `/v1/models` dynamic; do not reintroduce static model-list environment variables.
 
 ## Logging

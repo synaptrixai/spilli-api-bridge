@@ -81,9 +81,15 @@ OpenAI-style clients primarily use:
 
 ```text
 POST /v1/chat/completions
+POST /v1/responses
 ```
 
-The bridge supports streaming, but SpiLLI output is currently buffered until `session.run()` completes so Harmony/JSON tool calls can be translated into API-native tool-call blocks.
+The bridge has two response modes:
+
+- `raw` is the default. It returns SpiLLI model text as assistant text and does not infer tool calls from model output.
+- `compat` preserves the parser-based behavior that translates Harmony/JSON tool-call text into API-native tool-call blocks.
+
+Streaming in `raw` mode forwards SpiLLI SDK chunks as text deltas after `[EOG]` handling. Streaming in `compat` mode may wait for final post-processing when tool-call conversion is needed.
 
 ## Harmony Output
 
@@ -91,9 +97,9 @@ The SDK may return Harmony-formatted output containing analysis, commentary, fin
 
 For API responses:
 
-- Return only final assistant text to the client.
-- Do not expose analysis text.
-- Parse tool calls from raw output and translate them into Anthropic `tool_use` or OpenAI `tool_calls`.
+- In `raw` mode, return the raw SpiLLI model text as assistant text.
+- In `compat` mode, return final assistant text and translate tool calls into Anthropic `tool_use`, OpenAI `tool_calls`, or OpenAI Responses `function_call` items.
+- Do not expose analysis text in `compat` mode.
 
 `renderHarmonyForDisplay()` is suitable for VS Code UI display, but API responses should use final text, not the display text that includes analysis sections.
 
@@ -109,7 +115,7 @@ curl "http://localhost:8888/v1/models?refresh=true"
 curl -N http://localhost:8888/v1/messages \
   -H "content-type: application/json" \
   -H "x-api-key: sk-spilli-local" \
-  -d '{"model":"Openai Gpt Oss 20b","max_tokens":128,"messages":[{"role":"user","content":"Say hello in one sentence."}]}'
+  -d '{"model":"Openai_Gpt Oss 20b","max_tokens":128,"messages":[{"role":"user","content":"Say hello in one sentence."}]}'
 ```
 
 Production builds should avoid verbose request tracing or logs that expose local PEM paths, model UIDs, prompts, or responses. Prefer returning structured API errors to clients.

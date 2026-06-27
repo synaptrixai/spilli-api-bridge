@@ -8,6 +8,8 @@ Tools such as Claude Code can route model requests through a local gateway by se
 
 It also exposes OpenAI-compatible chat completions for tools that use the `/v1/chat/completions` pattern.
 
+Agent CLIs such as Codex and Claude Code require API-native tool-call objects before they execute tools. Use `SPILLI_BRIDGE_RESPONSE_MODE=compat` for those clients. `raw` mode is useful for plain text relay testing, but clients will treat model text that looks like a tool call as ordinary assistant text.
+
 ## Run
 
 ```sh
@@ -75,6 +77,7 @@ services:
       SPILLI_BRIDGE_AUTH_TOKEN: ${SPILLI_BRIDGE_AUTH_TOKEN:-}
       SPILLI_BRIDGE_REQUEST_TIMEOUT_MS: ${SPILLI_BRIDGE_REQUEST_TIMEOUT_MS:-600000}
       SPILLI_BRIDGE_MODEL_CACHE_TTL_MS: ${SPILLI_BRIDGE_MODEL_CACHE_TTL_MS:-30000}
+      SPILLI_BRIDGE_RESPONSE_MODE: ${SPILLI_BRIDGE_RESPONSE_MODE:-compat}
       SPILLI_BRIDGE_REUSE_SESSIONS: ${SPILLI_BRIDGE_REUSE_SESSIONS:-1}
     volumes:
       - ${SPILLI_PEM_DIR:-${HOME}/.spilli}:/home/node/.spilli:ro
@@ -115,10 +118,11 @@ Set `SPILLI_BRIDGE_AUTH_TOKEN=sk-spilli-local` before starting the bridge if you
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 
-`/v1/messages` supports non-streaming responses and Anthropic SSE streaming. Streaming is buffered until the SpiLLI run completes so Harmony/JSON tool calls can be returned as Anthropic `tool_use` blocks.
+`/v1/messages` supports non-streaming responses and Anthropic SSE streaming.
 
-`/v1/chat/completions` supports non-streaming and OpenAI-style SSE streaming.
+`/v1/chat/completions` and `/v1/responses` support non-streaming and OpenAI-style SSE streaming.
 
 ## Configuration
 
@@ -133,6 +137,9 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_BRIDGE_AUTH_TOKEN`: optional local bearer/API key.
 - `SPILLI_BRIDGE_REQUEST_TIMEOUT_MS`: per-request SpiLLI timeout, default `600000`.
 - `SPILLI_BRIDGE_MODEL_CACHE_TTL_MS`: live model inventory cache TTL, default `30000`.
+- `SPILLI_BRIDGE_RESPONSE_MODE`: response conversion mode, default `raw`.
+  - `raw`: return SpiLLI model text as assistant text and do not infer tool calls.
+  - `compat`: parse Harmony/JSON tool-call text into Anthropic/OpenAI tool-call objects for clients that need API-native tool calls.
 - `SPILLI_BRIDGE_REUSE_SESSIONS`: set to `0` to force a fresh SpiLLI resource request for troubleshooting. Defaults to `1`, reusing the acquired network resource/session by model/scope while keeping chat history in each request payload.
 - `SPILLI_BRIDGE_NATIVE_CACHE_DIR`: optional native binary cache directory.
 
@@ -166,7 +173,7 @@ curl "http://localhost:8888/v1/models?refresh=true"
 
 Inference requests may pass either the friendly model id returned from `/v1/models` or the raw UID. The bridge resolves the friendly name back to the UID before calling `SpilliService`.
 
-Both Anthropic-compatible `/v1/messages` and OpenAI-compatible `/v1/chat/completions` support `stream: true`. Streaming forwards SpiLLI SDK chunks as SSE deltas and treats `[EOG]` as the end-of-generation marker instead of returning it to clients.
+Anthropic-compatible `/v1/messages`, OpenAI-compatible `/v1/chat/completions`, and OpenAI-compatible `/v1/responses` support `stream: true`. In `raw` mode, streaming forwards SpiLLI SDK chunks as SSE text deltas and treats `[EOG]` as the end-of-generation marker instead of returning it to clients. In `compat` mode, the bridge keeps the parser-based tool-call conversion behavior for clients that require native tool-call blocks.
 
 The bridge logs inbound inference requests and converted SpiLLI prompt/query payloads as JSONL at `~/.spilli/spilli-api-bridge-requests.jsonl`. Override with `SPILLI_BRIDGE_REQUEST_LOG_PATH` when needed. Auth tokens are not logged, and very large strings are truncated.
 
@@ -178,5 +185,5 @@ To test the same Anthropic endpoint Claude Code uses:
 curl -N http://localhost:8888/v1/messages \
   -H "content-type: application/json" \
   -H "x-api-key: sk-spilli-local" \
-  -d '{"model":"Openai Gpt Oss 20b","max_tokens":128,"messages":[{"role":"user","content":"Say hello in one sentence."}]}'
+  -d '{"model":"Openai_Gpt Oss 20b","max_tokens":128,"messages":[{"role":"user","content":"Say hello in one sentence."}]}'
 ```
