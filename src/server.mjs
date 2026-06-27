@@ -1999,6 +1999,528 @@ function scopePayload(config, message) {
   };
 }
 
+function responsesContentToText(content) {
+  if (typeof content === 'string') return content;
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => responsesContentToText(part))
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (!isRecord(content)) return '';
+
+  if (content.type === 'input_text' || content.type === 'output_text') {
+    return asString(content.text);
+  }
+
+  if (content.type === 'refusal') {
+    return asString(content.refusal);
+  }
+
+  if (content.type === 'input_image') {
+    return '[Image input omitted by SpiLLI API bridge]';
+  }
+
+  if (content.type === 'input_file') {
+    const filename = asString(content.filename).trim();
+    return `[File input omitted by SpiLLI API bridge${filename ? `: ${filename}` : ''}]`;
+  }
+
+  const direct = asString(content.text || content.content || content.output);
+  if (direct) return direct;
+
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return '';
+  }
+}
+
+function responsesInputItemRole(item) {
+  if (!isRecord(item)) return '';
+  return asString(item.role).trim().toLowerCase();
+}
+
+function responsesInputItemToText(item) {
+  if (typeof item === 'string') {
+    return `USER:\n${item}`;
+  }
+
+  if (!isRecord(item)) return '';
+
+  if (item.type === 'function_call_output') {
+    const callId = asString(item.call_id).trim() || 'unknown';
+    return `TOOL RESULT ${callId}:\n${responsesContentToText(item.output)}`;
+  }
+
+  if (item.type === 'function_call') {
+    return [
+      `ASSISTANT TOOL CALL ${asString(item.name).trim() || 'function'}:`,
+      `call_id: ${asString(item.call_id).trim()}`,
+      `arguments: ${asString(item.arguments).trim()}`
+    ].join('\n');
+  }
+
+  const role = asString(item.role || 'user').trim().toUpperCase() || 'USER';
+  return `${role}:\n${responsesContentToText(item.content)}`;
+}
+
+function responsesToSpilliPayload(body) {
+  const input = body.input;
+  const inputItems = Array.isArray(input) ? input : [];
+
+  const isInstructionItem = (item) => {
+    const role = responsesInputItemRole(item);
+    return role === 'system' || role === 'developer';
+  };
+
+  const promptFromInputItems = inputItems
+    .filter(isInstructionItem)
+    .map(responsesInputItemToText)
+    .filter(Boolean)
+    .join('\n\n');
+
+  const queryFromInputItems = inputItems
+    .filter((item) => !isInstructionItem(item))
+    .map(responsesInputItemToText)
+    .filter(Boolean)
+    .join('\n\n');
+
+  const prompt = [
+    asString(body.instructions).trim(),
+    promptFromInputItems,
+    formatToolsForPrompt(body.tools)
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
+  const query =
+    typeof input === 'string'
+      ? `USER:\n${input}`
+      : queryFromInputItems;
+
+  return {
+    requestedModel: asString(body.model).trim(),
+    prompt,
+    query
+  };
+}
+
+function createResponseId(prefix = 'resp') {
+  return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeResponseCallId(value) {
+  const raw =
+    asString(value).trim() ||
+    `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+  const safe = raw.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 58);
+  return safe.startsWith('call_') ? safe.slice(0, 64) : `call_${safe}`.slice(0, 64);
+}
+
+function toResponsesOutputItems({
+  raw,
+  toolsEnabled = false,
+  allowedToolNames = [],
+  messageId = undefined
+}) {
+  const toolCalls = toolsEnabled
+    ? parseToolCallsFromOutput(raw, allowedToolNames)
+    : [];
+
+  const text = renderText(raw, toolCalls);
+  const output = [];
+
+  if (text) {
+    output.push({
+      id: messageId || createResponseId('msg'),
+      type: 'message',
+      status: 'completed',
+      role: 'assistant',
+      content: [
+        {
+          type: 'output_text',
+          text,
+          annotations: []
+        }
+      ]
+    });
+  }
+
+  for (const call of toolCalls) {
+    output.push({
+      id: createResponseId('fc'),
+      type: 'function_call',
+      status: 'completed',
+      call_id: normalizeResponseCallId(call.id),
+      name: call.name,
+      arguments: JSON.stringify(call.input ?? {})
+    });
+  }
+
+  return { output, text, toolCalls };
+}
+
+function outputTextFromResponsesOutput(output) {
+  return output
+    .filter((item) => item.type === 'message')
+    .flatMap((item) => item.content ?? [])
+    .filter((part) => part.type === 'output_text')
+    .map((part) => part.text)
+    .join('');
+}
+
+function createResponsesObject({
+  id,
+  body,
+  model,
+  output,
+  status = 'completed',
+  createdAt,
+  completedAt = null,
+  rawText = ''
+}) {
+  const inputText =
+    typeof body.input === 'string'
+      ? body.input
+      : Array.isArray(body.input)
+        ? body.input.map(responsesInputItemToText).join('\n\n')
+        : '';
+
+  const outputText = outputTextFromResponsesOutput(output);
+  const inputTokens = estimateTokens(
+    [body.instructions, inputText].filter(Boolean).join('\n\n')
+  );
+  const outputTokens = estimateTokens(rawText || outputText);
+
+  return {
+    id,
+    object: 'response',
+    created_at: createdAt,
+    status,
+    completed_at: completedAt,
+    error: null,
+    incomplete_details: null,
+
+    instructions: body.instructions ?? null,
+    max_output_tokens: body.max_output_tokens ?? null,
+    model: model || asString(body.model).trim() || 'spilli',
+
+    output,
+    output_text: outputText,
+
+    parallel_tool_calls: body.parallel_tool_calls ?? true,
+    previous_response_id: body.previous_response_id ?? null,
+    reasoning: body.reasoning ?? null,
+    store: body.store ?? false,
+    temperature: body.temperature ?? null,
+    text: body.text ?? { format: { type: 'text' } },
+    tool_choice: body.tool_choice ?? 'auto',
+    tools: Array.isArray(body.tools) ? body.tools : [],
+    top_p: body.top_p ?? null,
+    truncation: body.truncation ?? 'disabled',
+    user: body.user ?? null,
+    metadata: body.metadata ?? {},
+
+    usage:
+      status === 'completed'
+        ? {
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            output_tokens_details: {
+              reasoning_tokens: 0
+            },
+            total_tokens: inputTokens + outputTokens
+          }
+        : null,
+
+    end_turn: status === 'completed'
+  };
+}
+
+function writeResponsesSse(res, event) {
+  res.write(`event: ${event.type}\n`);
+  res.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
+async function handleOpenAiResponses(req, res, config) {
+  const body = await readBody(req);
+  const payload = responsesToSpilliPayload(body);
+
+  const id = createResponseId('resp');
+  const createdAt = Math.floor(Date.now() / 1000);
+  const messageId = createResponseId('msg');
+
+  const allowedToolNames = extractAvailableToolNames(body.tools);
+  const toolsEnabled = allowedToolNames.length > 0;
+
+  await logInferenceRequest('openai.responses', req, body, payload, {
+    requestId: id,
+    allowedToolNames,
+    toolsEnabled
+  });
+
+  if (body.stream === true) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      connection: 'keep-alive',
+      ...corsHeaders()
+    });
+
+    let sequenceNumber = 1;
+    let streamModel = payload.requestedModel || asString(body.model).trim() || 'spilli';
+    let rawForStream = '';
+    let streamedText = '';
+
+    let outputItemStarted = false;
+    let contentPartStarted = false;
+
+    const emit = (event) => {
+      writeResponsesSse(res, {
+        ...event,
+        sequence_number: sequenceNumber++
+      });
+    };
+
+    const ensureTextOutputStarted = () => {
+      if (!outputItemStarted) {
+        outputItemStarted = true;
+        emit({
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: {
+            id: messageId,
+            type: 'message',
+            status: 'in_progress',
+            role: 'assistant',
+            content: []
+          }
+        });
+      }
+
+      if (!contentPartStarted) {
+        contentPartStarted = true;
+        emit({
+          type: 'response.content_part.added',
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: {
+            type: 'output_text',
+            text: '',
+            annotations: []
+          }
+        });
+      }
+    };
+
+    try {
+      const created = createResponsesObject({
+        id,
+        body,
+        model: streamModel,
+        output: [],
+        status: 'in_progress',
+        createdAt,
+        rawText: ''
+      });
+
+      emit({
+        type: 'response.created',
+        response: created
+      });
+
+      const result = await runInference(payload, config, {
+        onStart: ({ requestedModel }) => {
+          streamModel = requestedModel || streamModel;
+        },
+
+        onChunk: (chunk) => {
+          rawForStream += chunk;
+
+          const nextText = streamableText(rawForStream);
+
+          // If the Harmony parser temporarily cannot produce monotonic display text,
+          // wait for the final post-processing path below.
+          if (!nextText || !nextText.startsWith(streamedText)) return;
+
+          const delta = nextText.slice(streamedText.length);
+          streamedText = nextText;
+
+          if (!delta) return;
+
+          ensureTextOutputStarted();
+
+          emit({
+            type: 'response.output_text.delta',
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            delta
+          });
+        }
+      });
+
+      const { output, toolCalls } = toResponsesOutputItems({
+        raw: result.raw,
+        toolsEnabled,
+        allowedToolNames,
+        messageId
+      });
+
+      await logInferenceResponse('openai.responses.response', {
+        id,
+        stream: true,
+        model: result.requestedModel,
+        allowedToolNames,
+        raw: result.raw,
+        harmony: harmonySummary(result.raw),
+        parsedToolCalls: toolCalls,
+        emittedOutput: output
+      });
+
+      const messageItem = output.find((item) => item.type === 'message');
+      const finalText =
+        messageItem?.content?.find((part) => part.type === 'output_text')?.text ?? '';
+
+      if (finalText) {
+        ensureTextOutputStarted();
+
+        if (finalText.startsWith(streamedText)) {
+          const tail = finalText.slice(streamedText.length);
+          if (tail) {
+            emit({
+              type: 'response.output_text.delta',
+              item_id: messageId,
+              output_index: 0,
+              content_index: 0,
+              delta: tail
+            });
+          }
+        }
+
+        emit({
+          type: 'response.output_text.done',
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          text: finalText
+        });
+
+        emit({
+          type: 'response.content_part.done',
+          item_id: messageId,
+          output_index: 0,
+          content_index: 0,
+          part: {
+            type: 'output_text',
+            text: finalText,
+            annotations: []
+          }
+        });
+
+        emit({
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: messageItem
+        });
+      }
+
+      let outputIndex = finalText ? 1 : 0;
+
+      for (const item of output.filter((entry) => entry.type !== 'message')) {
+        emit({
+          type: 'response.output_item.done',
+          output_index: outputIndex,
+          item
+        });
+        outputIndex += 1;
+      }
+
+      const completed = createResponsesObject({
+        id,
+        body,
+        model: result.requestedModel || streamModel,
+        output,
+        status: 'completed',
+        createdAt,
+        completedAt: Math.floor(Date.now() / 1000),
+        rawText: result.raw
+      });
+
+      emit({
+        type: 'response.completed',
+        response: completed
+      });
+
+      res.end();
+    } catch (err) {
+      const failed = createResponsesObject({
+        id,
+        body,
+        model: streamModel,
+        output: [],
+        status: 'failed',
+        createdAt,
+        completedAt: Math.floor(Date.now() / 1000),
+        rawText: ''
+      });
+
+      failed.error = {
+        code: 'api_error',
+        message: err instanceof Error ? err.message : String(err)
+      };
+
+      emit({
+        type: 'response.failed',
+        response: failed
+      });
+
+      res.end();
+    }
+
+    return;
+  }
+
+  const result = await runInference(payload, config);
+
+  const { output, toolCalls } = toResponsesOutputItems({
+    raw: result.raw,
+    toolsEnabled,
+    allowedToolNames
+  });
+
+  await logInferenceResponse('openai.responses.response', {
+    id,
+    stream: false,
+    model: result.requestedModel,
+    allowedToolNames,
+    raw: result.raw,
+    harmony: harmonySummary(result.raw),
+    parsedToolCalls: toolCalls,
+    emittedOutput: output
+  });
+
+  json(
+    res,
+    200,
+    createResponsesObject({
+      id,
+      body,
+      model: result.requestedModel,
+      output,
+      status: 'completed',
+      createdAt,
+      completedAt: Math.floor(Date.now() / 1000),
+      rawText: result.raw
+    })
+  );
+}
+
 async function handleScope(req, res, config) {
   if (req.method === 'GET') {
     json(res, 200, scopePayload(config));
@@ -2077,6 +2599,13 @@ async function route(req, res) {
   }
   if (req.method === 'POST' && url.pathname === '/v1/messages/count_tokens') {
     await handleAnthropicCountTokens(req, res, config);
+    return;
+  }
+  if (
+    req.method === 'POST' &&
+    (url.pathname === '/v1/responses' || url.pathname === '/responses')
+  ) {
+    await handleOpenAiResponses(req, res, config);
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
