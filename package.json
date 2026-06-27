@@ -6,7 +6,8 @@
   "description": "Anthropic/OpenAI-compatible API bridge for local SpiLLI model inference.",
   "scripts": {
     "start": "node src/server.mjs",
-    "check": "node --check src/server.mjs"
+    "check": "node --check src/server.mjs",
+    "test": "node test/response-rendering.test.mjs"
   },
   "dependencies": {
     "@synaptrix/spilli": "^0.4.5"

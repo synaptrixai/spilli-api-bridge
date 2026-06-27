@@ -1138,37 +1138,77 @@ function stripDisplaySections(text) {
   return finalMatch?.[1]?.trim() || normalized;
 }
 
-function extractHarmonyFinalText(raw) {
-  const parsed = parseHarmonyOutput(raw);
-  if (!parsed.isHarmony) {
-    return undefined;
-  }
-  return parsed.messages
-    .filter(segment => asString(segment.channel).trim().split(/\s+/)[0] === 'final')
-    .map(segment => asString(segment.content))
-    .filter(Boolean)
-    .join('\n');
+function stripHarmonyControlTokens(text) {
+  return String(text ?? '')
+    .replace(/<\|(?:start|end|call|return|channel|message|constrain)\|>/g, '')
+    .replace(/\[EOG\]\s*$/g, '')
+    .trim();
 }
 
-function streamableText(raw) {
-  const finalText = extractHarmonyFinalText(raw);
-  if (typeof finalText === 'string') {
-    return finalText;
+function extractHarmonyChannelText(raw, channelName) {
+  const text = String(raw ?? '');
+  const channelToken = '<|channel|>';
+  const messageToken = '<|message|>';
+  const wanted = channelName.toLowerCase();
+  let cursor = 0;
+  let found;
+
+  while (cursor < text.length) {
+    const channelAt = text.indexOf(channelToken, cursor);
+    if (channelAt < 0) {
+      break;
+    }
+    const channelStart = channelAt + channelToken.length;
+    const messageAt = text.indexOf(messageToken, channelStart);
+    if (messageAt < 0) {
+      break;
+    }
+    const channelHeader = text.slice(channelStart, messageAt).trim().toLowerCase();
+    const channel = channelHeader.split(/\s+/)[0];
+    const contentStart = messageAt + messageToken.length;
+    const terminators = ['<|end|>', '<|call|>', '<|return|>', '<|start|>', '<|channel|>']
+      .map(token => text.indexOf(token, contentStart))
+      .filter(index => index >= 0);
+    const contentEnd = terminators.length > 0 ? Math.min(...terminators) : text.length;
+
+    if (channel === wanted) {
+      found = stripHarmonyControlTokens(text.slice(contentStart, contentEnd));
+    }
+
+    cursor = contentEnd > contentStart ? contentEnd : messageAt + messageToken.length;
   }
-  return stripDisplaySections(renderHarmonyForDisplay(raw).display);
+
+  return typeof found === 'string' ? found : undefined;
+}
+
+function extractHarmonyFinalText(raw) {
+  const parsed = parseHarmonyOutput(raw);
+  if (parsed.isHarmony) {
+    const parsedFinal = parsed.messages
+      .filter(segment => asString(segment.channel).trim().split(/\s+/)[0] === 'final')
+      .map(segment => stripHarmonyControlTokens(segment.content))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (parsedFinal) {
+      return parsedFinal;
+    }
+  }
+  return extractHarmonyChannelText(raw, 'final');
 }
 
 function renderText(raw, toolCalls) {
   const rendered = renderHarmonyForDisplay(raw);
   if (toolCalls.length > 0) {
     const text = extractHarmonyFinalText(raw) ?? (rendered.isHarmony ? '' : raw);
-    const trimmed = stripDisplaySections(text);
+    const trimmed = stripHarmonyControlTokens(stripDisplaySections(text));
     if (!trimmed.startsWith('{') && !trimmed.startsWith('```json')) {
       return trimmed;
     }
     return '';
   }
-  return extractHarmonyFinalText(raw) ?? (rendered.isHarmony ? '' : stripDisplaySections(rendered.display));
+  const text = extractHarmonyFinalText(raw) ?? (rendered.isHarmony ? '' : stripDisplaySections(rendered.display));
+  return stripHarmonyControlTokens(text);
 }
 
 function normalizeContent(content) {
@@ -1940,7 +1980,10 @@ async function handleOpenAiChatCompletions(req, res, config) {
         },
         onChunk: chunk => {
           rawForStream += chunk;
-          const nextText = rawMode ? rawForStream : streamableText(rawForStream);
+          if (!rawMode) {
+            return;
+          }
+          const nextText = rawForStream;
           if (!nextText || !nextText.startsWith(streamedText)) {
             return;
           }
@@ -2444,10 +2487,12 @@ async function handleOpenAiResponses(req, res, config) {
 
         onChunk: (chunk) => {
           rawForStream += chunk;
+          if (!rawMode) {
+            return;
+          }
 
-          const nextText = rawMode ? rawForStream : streamableText(rawForStream);
+          const nextText = rawForStream;
 
-          // In compat mode, wait for final post-processing if Harmony display text is not monotonic.
           if (!nextText || !nextText.startsWith(streamedText)) return;
 
           const delta = nextText.slice(streamedText.length);
@@ -2726,9 +2771,18 @@ const server = http.createServer((req, res) => {
   route(req, res).catch(err => errorJson(res, err));
 });
 
-loadEnvFiles();
-const config = getConfig();
-server.listen(config.port, config.host, () => {
-  console.log(`SpiLLI API bridge listening at http://${config.host}:${config.port}`);
-  console.log(`SpiLLI API bridge request log: ${expandHome(getRequestLogPath())}`);
-});
+export {
+  extractHarmonyFinalText,
+  parseToolCallsFromOutput,
+  renderText,
+  toResponsesOutputItems
+};
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  loadEnvFiles();
+  const config = getConfig();
+  server.listen(config.port, config.host, () => {
+    console.log(`SpiLLI API bridge listening at http://${config.host}:${config.port}`);
+    console.log(`SpiLLI API bridge request log: ${expandHome(getRequestLogPath())}`);
+  });
+}
