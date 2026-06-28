@@ -1767,12 +1767,12 @@ async function handleAnthropicMessages(req, res, config) {
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
   const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-  await logInferenceRequest('anthropic.messages', req, body, payload, {
-    requestId: id,
-    allowedToolNames,
-    toolsEnabled,
-    responseMode: config.responseMode
-  });
+  // await logInferenceRequest('anthropic.messages', req, body, payload, {
+  //   requestId: id,
+  //   allowedToolNames,
+  //   toolsEnabled,
+  //   responseMode: config.responseMode
+  // });
   if (body.stream === true) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -1855,19 +1855,19 @@ async function handleAnthropicMessages(req, res, config) {
       const emittedMessage = rawMode
         ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
         : message;
-      await logInferenceResponse('anthropic.messages.response', {
-        id,
-        stream: true,
-        retried,
-        responseMode: config.responseMode,
-        model: result.requestedModel,
-        allowedToolNames,
-        raw: result.raw,
-        harmony: rawMode ? undefined : harmonySummary(result.raw),
-        parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
-        emittedContent: emittedMessage.content,
-        stopReason: emittedMessage.stop_reason
-      });
+      // await logInferenceResponse('anthropic.messages.response', {
+      //   id,
+      //   stream: true,
+      //   retried,
+      //   responseMode: config.responseMode,
+      //   model: result.requestedModel,
+      //   allowedToolNames,
+      //   raw: result.raw,
+      //   harmony: rawMode ? undefined : harmonySummary(result.raw),
+      //   parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
+      //   emittedContent: emittedMessage.content,
+      //   stopReason: emittedMessage.stop_reason
+      // });
       const finalTextBlock = emittedMessage.content.find(block => block.type === 'text');
       if (finalTextBlock?.text && finalTextBlock.text.startsWith(streamedText)) {
         const delta = finalTextBlock.text.slice(streamedText.length);
@@ -1928,29 +1928,29 @@ async function handleAnthropicMessages(req, res, config) {
   const emittedMessage = rawMode
     ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
     : message;
-  await logInferenceResponse('anthropic.messages.response', {
-    id,
-    stream: false,
-    retried,
-    responseMode: config.responseMode,
-    model: result.requestedModel,
-    allowedToolNames,
-    raw: result.raw,
-    harmony: rawMode ? undefined : harmonySummary(result.raw),
-    parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
-    emittedContent: emittedMessage.content,
-    stopReason: emittedMessage.stop_reason
-  });
+  // await logInferenceResponse('anthropic.messages.response', {
+  //   id,
+  //   stream: false,
+  //   retried,
+  //   responseMode: config.responseMode,
+  //   model: result.requestedModel,
+  //   allowedToolNames,
+  //   raw: result.raw,
+  //   harmony: rawMode ? undefined : harmonySummary(result.raw),
+  //   parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
+  //   emittedContent: emittedMessage.content,
+  //   stopReason: emittedMessage.stop_reason
+  // });
   json(res, 200, emittedMessage);
 }
 
 async function handleAnthropicCountTokens(req, res, config) {
   const body = await readBody(req);
   const payload = anthropicToSpilliPayload(body);
-  await logInferenceRequest('anthropic.count_tokens', req, body, payload, { requestId: `tok_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}` });
-  json(res, 200, {
-    input_tokens: estimateTokens(`${payload.prompt}\n\n${payload.query}`)
-  });
+  // await logInferenceRequest('anthropic.count_tokens', req, body, payload, { requestId: `tok_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}` });
+  // json(res, 200, {
+  //   input_tokens: estimateTokens(`${payload.prompt}\n\n${payload.query}`)
+  // });
 }
 
 function toOpenAiChatCompletion({
@@ -2005,12 +2005,12 @@ async function handleOpenAiChatCompletions(req, res, config) {
   const allowedToolNames = extractAvailableToolNames(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
-  await logInferenceRequest('openai.chat_completions', req, body, payload, {
-    requestId: id,
-    allowedToolNames,
-    toolsEnabled,
-    responseMode: config.responseMode
-  });
+  // await logInferenceRequest('openai.chat_completions', req, body, payload, {
+  //   requestId: id,
+  //   allowedToolNames,
+  //   toolsEnabled,
+  //   responseMode: config.responseMode
+  // });
   const created = Math.floor(Date.now() / 1000);
   if (body.stream === true) {
     res.writeHead(200, {
@@ -2485,12 +2485,12 @@ async function handleOpenAiResponses(req, res, config) {
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
 
-  await logInferenceRequest('openai.responses', req, body, payload, {
-    requestId: id,
-    allowedToolNames,
-    toolsEnabled,
-    responseMode: config.responseMode
-  });
+  // await logInferenceRequest('openai.responses', req, body, payload, {
+  //   requestId: id,
+  //   allowedToolNames,
+  //   toolsEnabled,
+  //   responseMode: config.responseMode
+  // });
 
   if (body.stream === true) {
     res.writeHead(200, {
