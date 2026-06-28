@@ -20,6 +20,11 @@ const toolOnly = [
   '<|start|>assistant<|channel|>commentary to=exec_command <|constrain|>json<|message|>{"cmd":"ls -1"}<|call|>'
 ].join('');
 
+const patchTool = [
+  '<|channel|>analysis<|message|>Need to patch the README.<|end|>',
+  '<|start|>assistant<|channel|>commentary to=apply_patch <|constrain|>json<|message|>*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch<|end|>'
+].join('');
+
 const partialFinal = '<|channel|>final<|message|>Clean final text without a terminator';
 
 assert.equal(
@@ -50,6 +55,22 @@ assert.equal(
   '',
   'does not expose analysis or tool-call payload as assistant text'
 );
+
+const patchOutput = toResponsesOutputItems({
+  raw: patchTool,
+  toolsEnabled: true,
+  allowedToolNames: ['exec_command', 'apply_patch'],
+  toolTypes: { exec_command: 'function', apply_patch: 'custom' },
+  responseMode: 'compat'
+});
+
+assert.deepEqual(
+  patchOutput.output.map(item => item.type),
+  ['custom_tool_call'],
+  'emits native Responses custom tool calls for custom tools'
+);
+assert.equal(patchOutput.output[0].name, 'apply_patch');
+assert.match(patchOutput.output[0].input, /^\*\*\* Begin Patch/);
 
 const { output, toolCalls } = toResponsesOutputItems({
   raw: toolThenFinal,

@@ -137,6 +137,7 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_BRIDGE_AUTH_TOKEN`: optional local bearer/API key.
 - `SPILLI_BRIDGE_REQUEST_TIMEOUT_MS`: per-request SpiLLI timeout, default `600000`.
 - `SPILLI_BRIDGE_MODEL_CACHE_TTL_MS`: live model inventory cache TTL, default `30000`.
+- `SPILLI_BRIDGE_MODEL_ALIASES`: optional model aliases in `client_name=spilli_name` form, separated by commas or semicolons. No aliases are built in; model names pass through unchanged unless this variable is set.
 - `SPILLI_BRIDGE_RESPONSE_MODE`: response conversion mode, default `raw`.
   - `raw`: return SpiLLI model text as assistant text and do not infer tool calls.
   - `compat`: parse Harmony/JSON tool-call text into Anthropic/OpenAI tool-call objects for clients that need API-native tool calls.

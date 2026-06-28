@@ -148,6 +148,26 @@ function normalizeResponseMode(value) {
   return 'raw';
 }
 
+function parseModelAliases(value) {
+  const aliases = new Map();
+  const raw = String(value ?? '').trim();
+  if (!raw) {
+    return aliases;
+  }
+  for (const entry of raw.split(/[;,]/)) {
+    const index = entry.indexOf('=');
+    if (index <= 0) {
+      continue;
+    }
+    const key = entry.slice(0, index).trim();
+    const target = entry.slice(index + 1).trim();
+    if (key && target) {
+      aliases.set(key, target);
+    }
+  }
+  return aliases;
+}
+
 function getConfig() {
   const requestTimeoutMs = Number.parseInt(readEnv('SPILLI_BRIDGE_REQUEST_TIMEOUT_MS'), 10);
   const modelCacheTtlMs = Number.parseInt(readEnv('SPILLI_BRIDGE_MODEL_CACHE_TTL_MS'), 10);
@@ -164,6 +184,7 @@ function getConfig() {
       Number.isFinite(modelCacheTtlMs) && modelCacheTtlMs > 0 ? modelCacheTtlMs : DEFAULT_MODEL_CACHE_TTL_MS,
     reuseSessions: readEnv('SPILLI_BRIDGE_REUSE_SESSIONS', '1') !== '0',
     nativeCacheDir: readEnv('SPILLI_BRIDGE_NATIVE_CACHE_DIR'),
+    modelAliases: parseModelAliases(readEnv('SPILLI_BRIDGE_MODEL_ALIASES')),
     responseMode: normalizeResponseMode(readEnv('SPILLI_BRIDGE_RESPONSE_MODE', 'raw'))
   };
 }
@@ -662,7 +683,7 @@ async function fetchAvailableModels(config, { forceRefresh = false } = {}) {
   }
 }
 
-function resolveModelFromCatalog(requestedModel, catalog) {
+function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map()) {
   const requested = requestedModel.trim();
   if (!catalog.models.length) {
     throw Object.assign(new Error(`No SpiLLI models are available for scope "${catalog.scope}".`), { statusCode: 503 });
@@ -703,6 +724,16 @@ function resolveModelFromCatalog(requestedModel, catalog) {
       statusCode: 404
     });
   }
+  for (const [alias, target] of modelAliases.entries()) {
+    if (normalizeModelLookupName(alias) !== normalized) {
+      continue;
+    }
+    const resolved = resolveModelFromCatalog(target, catalog, new Map());
+    return {
+      ...resolved,
+      requestedAlias: requested
+    };
+  }
   const available = catalog.models.map(model => model.apiName).join(', ');
   throw Object.assign(new Error(`Unknown model "${requested}". Available ${catalog.scope} models: ${available}`), {
     statusCode: 404
@@ -713,7 +744,7 @@ async function resolveRequestedModel(requestedModel, config) {
   let catalog = await fetchAvailableModels(config);
   const cacheKey = catalogCacheKey(config);
   try {
-    const resolved = resolveModelFromCatalog(requestedModel, catalog);
+    const resolved = resolveModelFromCatalog(requestedModel, catalog, config.modelAliases);
     state.lastResolvedModelByScope.set(cacheKey, resolved);
     return resolved;
   } catch (err) {
@@ -722,7 +753,7 @@ async function resolveRequestedModel(requestedModel, config) {
     }
     catalog = await fetchAvailableModels(config, { forceRefresh: true });
     try {
-      const resolved = resolveModelFromCatalog(requestedModel, catalog);
+      const resolved = resolveModelFromCatalog(requestedModel, catalog, config.modelAliases);
       state.lastResolvedModelByScope.set(cacheKey, resolved);
       return resolved;
     } catch (refreshedErr) {
@@ -798,7 +829,7 @@ function toToolCall(value) {
     return undefined;
   }
   const responseFunctionName =
-    value.type === 'function_call' || typeof value.call_id === 'string' || typeof value.arguments !== 'undefined'
+    value.type === 'function_call' || value.type === 'custom_tool_call' || typeof value.call_id === 'string' || typeof value.arguments !== 'undefined'
       ? value.name
       : undefined;
   const toolName = asString(value.toolName || responseFunctionName).trim();
@@ -811,9 +842,16 @@ function toToolCall(value) {
     asString(value.id).trim() ||
     `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
   const args = parseToolArguments(
-    typeof value.args !== 'undefined' ? value.args : typeof value.arguments !== 'undefined' ? value.arguments : undefined
+    typeof value.args !== 'undefined'
+      ? value.args
+      : typeof value.arguments !== 'undefined'
+        ? value.arguments
+        : value.type === 'custom_tool_call'
+          ? value.input
+          : undefined
   );
-  return { id: callId, name: toolName, input: args };
+  const input = value.type === 'custom_tool_call' && typeof value.input === 'string' ? value.input : args;
+  return { id: callId, name: toolName, input };
 }
 
 function collectToolCalls(value, calls) {
@@ -873,6 +911,24 @@ function extractAvailableToolNames(tools) {
   return tools
     .map(tool => (isRecord(tool) ? asString(tool.name || tool.function?.name).trim() : ''))
     .filter(Boolean);
+}
+
+function extractResponsesToolTypes(tools) {
+  const types = {};
+  if (!Array.isArray(tools)) {
+    return types;
+  }
+  for (const tool of tools) {
+    if (!isRecord(tool)) {
+      continue;
+    }
+    const name = asString(tool.name || tool.function?.name).trim();
+    if (!name) {
+      continue;
+    }
+    types[normalizeToolNameForLookup(name)] = asString(tool.type || 'function').trim().toLowerCase() || 'function';
+  }
+  return types;
 }
 
 function resolveAllowedToolName(name, allowedToolNames = []) {
@@ -2195,11 +2251,24 @@ function responsesInputItemToText(item) {
     return `TOOL RESULT ${callId}:\n${responsesContentToText(item.output)}`;
   }
 
+  if (item.type === 'custom_tool_call_output') {
+    const callId = asString(item.call_id).trim() || 'unknown';
+    return `CUSTOM TOOL RESULT ${callId}:\n${responsesContentToText(item.output)}`;
+  }
+
   if (item.type === 'function_call') {
     return [
       `ASSISTANT TOOL CALL ${asString(item.name).trim() || 'function'}:`,
       `call_id: ${asString(item.call_id).trim()}`,
       `arguments: ${asString(item.arguments).trim()}`
+    ].join('\n');
+  }
+
+  if (item.type === 'custom_tool_call') {
+    return [
+      `ASSISTANT CUSTOM TOOL CALL ${asString(item.name).trim() || 'custom'}:`,
+      `call_id: ${asString(item.call_id).trim()}`,
+      `input: ${asString(item.input).trim()}`
     ].join('\n');
   }
 
@@ -2265,6 +2334,7 @@ function toResponsesOutputItems({
   raw,
   toolsEnabled = false,
   allowedToolNames = [],
+  toolTypes = {},
   messageId = undefined,
   responseMode = 'compat'
 }) {
@@ -2295,6 +2365,18 @@ function toResponsesOutputItems({
   }
 
   for (const call of toolCalls) {
+    const toolType = toolTypes[normalizeToolNameForLookup(call.name)] || 'function';
+    if (toolType === 'custom') {
+      output.push({
+        id: createResponseId('ctc'),
+        type: 'custom_tool_call',
+        status: 'completed',
+        call_id: normalizeResponseCallId(call.id),
+        name: call.name,
+        input: typeof call.input === 'string' ? call.input : asString(call.input?.patch || call.input?.input || call.input?.diff || JSON.stringify(call.input ?? {}))
+      });
+      continue;
+    }
     output.push({
       id: createResponseId('fc'),
       type: 'function_call',
@@ -2399,6 +2481,7 @@ async function handleOpenAiResponses(req, res, config) {
   const messageId = createResponseId('msg');
 
   const allowedToolNames = extractAvailableToolNames(body.tools);
+  const toolTypes = extractResponsesToolTypes(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
 
@@ -2516,6 +2599,7 @@ async function handleOpenAiResponses(req, res, config) {
         raw: result.raw,
         toolsEnabled,
         allowedToolNames,
+        toolTypes,
         messageId,
         responseMode: config.responseMode
       });
@@ -2641,6 +2725,7 @@ async function handleOpenAiResponses(req, res, config) {
     raw: result.raw,
     toolsEnabled,
     allowedToolNames,
+    toolTypes,
     responseMode: config.responseMode
   });
 
