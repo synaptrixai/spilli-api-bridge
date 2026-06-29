@@ -1955,9 +1955,9 @@ async function handleAnthropicCountTokens(req, res, config) {
   const body = await readBody(req);
   const payload = anthropicToSpilliPayload(body);
   // await logInferenceRequest('anthropic.count_tokens', req, body, payload, { requestId: `tok_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}` });
-  // json(res, 200, {
-  //   input_tokens: estimateTokens(`${payload.prompt}\n\n${payload.query}`)
-  // });
+  json(res, 200, {
+    input_tokens: estimateTokens(`${payload.prompt}\n\n${payload.query}`)
+  });
 }
 
 function toOpenAiChatCompletion({
