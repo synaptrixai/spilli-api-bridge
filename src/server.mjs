@@ -41,6 +41,45 @@ const state = {
   chatSessions: new Map()
 };
 
+/**
+ * Helper to determine a unique SpiLLI session key based on Codex request metadata.
+ * The `x-codex-turn-metadata` header contains JSON with `window_id`, `session_id`
+ * and `thread_id`. These three values are concatenated into a deterministic
+ * string. If a session for that key already exists in {@link state.chatSessions}
+ * it is reused; otherwise the key itself is used as the new session identifier.
+ *
+ * @param {import('node:http').IncomingMessage} req - HTTP request
+ * @returns {string|null} Session key or null if metadata missing/invalid
+ */
+function getSpilliSessionKey(req,body) {
+  const metaHeader = req.headers['x-codex-turn-metadata'];
+  // console.log('metaHeaders: ',metaHeader)
+  // console.log('body meta: ',body.client_metadata["x-codex-turn-metadata"])
+  if (!metaHeader){ 
+    // console.log('codex turn metadata missing')
+    return 'default';
+  }
+
+  let meta;
+  try {
+    meta = typeof metaHeader === 'string' ? JSON.parse(metaHeader) : metaHeader;
+  } catch {
+    // console.log('error parsing metadata')
+    return null;
+  }
+  const window_id = meta['window_id']
+  const session_id = meta['session_id']
+  const thread_id = meta['thread_id']
+  // const { window_id, session_id, thread_id } = meta || {};
+  if (!window_id || !session_id || !thread_id){ 
+    // console.log('returning default')
+    return 'default';}
+  
+  const key = `${window_id}:${session_id}:${thread_id}`;
+  // console.log('session key: ',key)
+  return key;
+}
+
 
 function parseEnvLine(line) {
   const trimmed = line.trim();
@@ -759,10 +798,10 @@ async function resolveRequestedModel(requestedModel, config) {
       state.lastResolvedModelByScope.set(cacheKey, resolved);
       return resolved;
     } catch (refreshedErr) {
-      if (refreshedErr?.statusCode === 404 && isClaudeCodeBuiltInModelName(requestedModel)) {
+      if (refreshedErr?.statusCode === 404 && isBridgeBuiltInModelName(requestedModel)) {
         const fallback = state.lastResolvedModelByScope.get(cacheKey) ?? catalog.models[0];
         if (fallback) {
-          console.warn(`Mapping Claude Code model alias "${requestedModel}" to SpiLLI model "${fallback.apiName}".`);
+          console.warn(`Mapping built-in bridge model alias "${requestedModel}" to SpiLLI model "${fallback.apiName}".`);
           return fallback;
         }
       }
@@ -902,8 +941,9 @@ function catalogCacheKey(config) {
   return `${config.keyPath}|${config.scope}|${config.team}`;
 }
 
-function isClaudeCodeBuiltInModelName(value) {
-  return /^claude[-_]/i.test(asString(value).trim());
+function isBridgeBuiltInModelName(value) {
+  const modelName = asString(value).trim();
+  return /^(claude[-_]|gpt[-_]|chatgpt[-_]|codex[-_]|o[1345](?:[-_]|$))/i.test(modelName);
 }
 
 function extractAvailableToolNames(tools) {
@@ -1459,27 +1499,25 @@ async function withResourceRunQueue(resource, callback) {
   return current;
 }
 
-async function runInference({ requestedModel, prompt, query }, config, streamOptions = {}, sessionOverride) {
-  const resolvedModel = await resolveRequestedModel(requestedModel, config);
-  const service = getService(config);
+// Run inference using an already created SpiLLI session.
+async function runInference({ requestedModel, prompt, query }, config, streamOptions = {}, session, resolvedModelOverride) {
+  // console.log('requested model: ',requestedModel)
+  const resolvedModel = resolvedModelOverride ?? await resolveRequestedModel(requestedModel, config);
+  // console.log('resolved model: ',resolvedModel)
+  // const service = getService(config);
   const resource = { model: resolvedModel.uid, scope: config.scope };
   if (config.team) {
     resource.team = config.team;
   }
   const apiModelName = requestedModel || resolvedModel.displayName;
+  // if (!session || !session.isLive()) {
+  //   session = service.request(resource, config.requestTimeoutMs);
+  // }
   return withResourceRunQueue(resource, async () => {
-    let session;
-    if (sessionOverride) {
-      session = sessionOverride;
-    } else {
-      session = config.reuseSessions
-        ? service.getOrCreateSession(resource, config.requestTimeoutMs)
-        : service.request(resource, config.requestTimeoutMs);
-    }
-    if (!session.isLive()) {
-      session = service.request(resource, config.requestTimeoutMs);
-    }
-    if (!session.isLive()) {
+    // if (!session.isLive()) {
+    //   session = service.request(resource, config.requestTimeoutMs);
+    // }
+    if (!session || !session.isLive()) {
       throw Object.assign(new Error('SpiLLI model session is not live.'), { statusCode: 503 });
     }
     streamOptions.onStart?.({ requestedModel: apiModelName, resolvedModel });
@@ -1497,6 +1535,35 @@ async function runInference({ requestedModel, prompt, query }, config, streamOpt
       resolvedModel
     };
   });
+}
+
+async function getOrCreateResponseSession(req, body, payload, config) {
+  const sessionKey = getSpilliSessionKey(req, body);
+  const service = getService(config);
+  const resolvedModel = await resolveRequestedModel(payload.requestedModel, config);
+  const resource = { model: resolvedModel.uid, scope: config.scope };
+  if (config.team) {
+    resource.team = config.team;
+  }
+
+  let chosenSession = sessionKey ? state.chatSessions.get(sessionKey)?.session : undefined;
+  if (chosenSession?.isLive?.()) {
+    // console.log('Reuse session: ', chosenSession);
+    return { sessionKey, chosenSession, resolvedModel };
+  }
+
+  // if (sessionKey && chosenSession) {
+  //   console.log('Cached session is not live, creating a new session for key: ', sessionKey);
+  // } else {
+  //   console.log('Create session: ', sessionKey);
+  // }
+
+  chosenSession = await service.request(resource, config.requestTimeoutMs);
+  if (sessionKey) {
+    state.chatSessions.set(sessionKey, { session: chosenSession });
+  }
+
+  return { sessionKey, chosenSession, resolvedModel };
 }
 
 function json(res, statusCode, payload, headers = {}) {
@@ -1589,11 +1656,22 @@ function getRequestLogPath() {
   return readEnv('SPILLI_BRIDGE_REQUEST_LOG_PATH', DEFAULT_REQUEST_LOG_PATH);
 }
 
-async function appendRequestLog(entry) {
+async function appendLog(entry,label) {
   const logPath = expandHome(getRequestLogPath());
   try {
     await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
-    await fs.promises.appendFile(logPath, `${JSON.stringify(sanitizeForLog(entry))}
+    await fs.promises.appendFile(logPath, `${label}: ${JSON.stringify(sanitizeForLog(entry))}
+`, 'utf8');
+  } catch (err) {
+    console.warn(`Failed to write SpiLLI API bridge request log: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function appendResponseLog(entry) {
+  const logPath = expandHome(getRequestLogPath());
+  try {
+    await fs.promises.mkdir(path.dirname(logPath), { recursive: true });
+    await fs.promises.appendFile(logPath, `RESPONSE: ${JSON.stringify(sanitizeForLog(entry))}
 `, 'utf8');
   } catch (err) {
     console.warn(`Failed to write SpiLLI API bridge request log: ${err instanceof Error ? err.message : String(err)}`);
@@ -1602,34 +1680,39 @@ async function appendRequestLog(entry) {
 
 async function logInferenceRequest(kind, req, body, payload, extra = {}) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
-  await appendRequestLog({
+  await appendLog({
     timestamp: new Date().toISOString(),
     kind,
     method: req.method,
     path: url.pathname,
-    query: Object.fromEntries(url.searchParams.entries()),
-    client: {
-      user_agent: asString(req.headers['user-agent']) || null,
-      anthropic_version: asString(req.headers['anthropic-version']) || null,
-      anthropic_beta: asString(req.headers['anthropic-beta']) || null
-    },
+    // query: Object.fromEntries(url.searchParams.entries()),
+    // client: {
+    //   user_agent: asString(req.headers['user-agent']) || null,
+    //   anthropic_version: asString(req.headers['anthropic-version']) || null,
+    //   anthropic_beta: asString(req.headers['anthropic-beta']) || null
+    // },
     request: {
       model: asString(body.model) || null,
       stream: body.stream === true,
       system: body.system ?? null,
-      tools: Array.isArray(body.tools) ? body.tools : [],
-      tool_names: extractAvailableToolNames(body.tools),
-      messages: Array.isArray(body.messages) ? body.messages : []
+      // body: body
+      // codexmeta: body.client_metadata["x-codex-turn-metadata"],
+      turnmeta:req.headers["x-codex-turn-metadata"],
+      subagent: req.headers["x-openai-subagent"],
+      // metadata: body.client_metadata,
+      // tools: Array.isArray(body.tools) ? body.tools : [],
+      // tool_names: extractAvailableToolNames(body.tools),
+      // messages: Array.isArray(body.messages) ? body.messages : []
     },
     bridge: {
       requestedModel: payload.requestedModel,
       promptLength: payload.prompt.length,
       queryLength: payload.query.length,
-      prompt: payload.prompt,
+      // prompt: payload.prompt,
       query: payload.query,
       ...extra
     }
-  });
+  },'REQUEST');
 }
 
 function harmonySummary(raw) {
@@ -1651,11 +1734,11 @@ function harmonySummary(raw) {
 }
 
 async function logInferenceResponse(kind, data) {
-  await appendRequestLog({
+  await appendLog({
     timestamp: new Date().toISOString(),
     kind,
     response: data
-  });
+  },'RESPONSE');
 }
 
 function toAnthropicMessage({ id, model, raw, toolsEnabled = false, allowedToolNames = [] }) {
@@ -2012,12 +2095,12 @@ async function handleOpenAiChatCompletions(req, res, config) {
   const allowedToolNames = extractAvailableToolNames(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
-  // await logInferenceRequest('openai.chat_completions', req, body, payload, {
-  //   requestId: id,
-  //   allowedToolNames,
-  //   toolsEnabled,
-  //   responseMode: config.responseMode
-  // });
+  await logInferenceRequest('openai.chat_completions', req, body, payload, {
+    requestId: id,
+    allowedToolNames,
+    toolsEnabled,
+    responseMode: config.responseMode
+  });
   const created = Math.floor(Date.now() / 1000);
   // Determine which session should be used based on chaining.
   const previousResponseId = body.previous_response_id || undefined;
@@ -2089,11 +2172,11 @@ async function handleOpenAiChatCompletions(req, res, config) {
         stream: true,
         responseMode: config.responseMode,
         model: result.requestedModel,
-        allowedToolNames,
-        raw: result.raw,
-        harmony: rawMode ? undefined : harmonySummary(result.raw),
-        parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
-        emittedChoice: completion.choices[0]
+        // allowedToolNames,
+        // raw: result.raw,
+        // harmony: rawMode ? undefined : harmonySummary(result.raw),
+        // parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
+        // emittedChoice: completion.choices[0]
       });
       const choice = completion.choices[0];
       if (choice.message.content && choice.message.content.startsWith(streamedText)) {
@@ -2170,11 +2253,11 @@ async function handleOpenAiChatCompletions(req, res, config) {
     stream: false,
     responseMode: config.responseMode,
     model: result.requestedModel,
-    allowedToolNames,
-    raw: result.raw,
-    harmony: rawMode ? undefined : harmonySummary(result.raw),
-    parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
-    emittedChoice: completion.choices[0]
+    // allowedToolNames,
+    // raw: result.raw,
+    // harmony: rawMode ? undefined : harmonySummary(result.raw),
+    // parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
+    // emittedChoice: completion.choices[0]
   });
   json(res, 200, completion);
 }
@@ -2494,7 +2577,6 @@ function writeResponsesSse(res, event) {
 async function handleOpenAiResponses(req, res, config) {
   const body = await readBody(req);
   const payload = responsesToSpilliPayload(body);
-
   const id = createResponseId('resp');
   const createdAt = Math.floor(Date.now() / 1000);
   const messageId = createResponseId('msg');
@@ -2503,13 +2585,12 @@ async function handleOpenAiResponses(req, res, config) {
   const toolTypes = extractResponsesToolTypes(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
-
-  // await logInferenceRequest('openai.responses', req, body, payload, {
-  //   requestId: id,
-  //   allowedToolNames,
-  //   toolsEnabled,
-  //   responseMode: config.responseMode
-  // });
+  await logInferenceRequest('openai.responses', req, body, payload, {
+    requestId: id,
+    // allowedToolNames,
+    // toolsEnabled,
+    // responseMode: config.responseMode
+  });
 
   if (body.stream === true) {
     res.writeHead(200, {
@@ -2526,7 +2607,6 @@ async function handleOpenAiResponses(req, res, config) {
 
     let outputItemStarted = false;
     let contentPartStarted = false;
-
     const emit = (event) => {
       writeResponsesSse(res, {
         ...event,
@@ -2581,7 +2661,7 @@ async function handleOpenAiResponses(req, res, config) {
         type: 'response.created',
         response: created
       });
-
+      const { chosenSession, resolvedModel } = await getOrCreateResponseSession(req, body, payload, config);
       const result = await runInference(payload, config, {
         onStart: ({ requestedModel }) => {
           streamModel = requestedModel || streamModel;
@@ -2612,7 +2692,7 @@ async function handleOpenAiResponses(req, res, config) {
             delta
           });
         }
-      });
+      }, chosenSession, resolvedModel);
 
       const { output, toolCalls } = toResponsesOutputItems({
         raw: result.raw,
@@ -2628,11 +2708,11 @@ async function handleOpenAiResponses(req, res, config) {
         stream: true,
         responseMode: config.responseMode,
         model: result.requestedModel,
-        allowedToolNames,
-        raw: result.raw,
-        harmony: rawMode ? undefined : harmonySummary(result.raw),
+        // allowedToolNames,
+        // raw: result.raw,
+        // harmony: rawMode ? undefined : harmonySummary(result.raw),
         parsedToolCalls: toolCalls,
-        emittedOutput: output
+        // emittedOutput: output
       });
 
       const messageItem = output.find((item) => item.type === 'message');
@@ -2737,8 +2817,8 @@ async function handleOpenAiResponses(req, res, config) {
 
     return;
   }
-
-  const result = await runInference(payload, config);
+  const { chosenSession, resolvedModel } = await getOrCreateResponseSession(req, body, payload, config);
+  const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
 
   const { output, toolCalls } = toResponsesOutputItems({
     raw: result.raw,
@@ -2753,11 +2833,11 @@ async function handleOpenAiResponses(req, res, config) {
     stream: false,
     responseMode: config.responseMode,
     model: result.requestedModel,
-    allowedToolNames,
-    raw: result.raw,
-    harmony: rawMode ? undefined : harmonySummary(result.raw),
+    // allowedToolNames,
+    // raw: result.raw,
+    // harmony: rawMode ? undefined : harmonySummary(result.raw),
     parsedToolCalls: toolCalls,
-    emittedOutput: output
+    // emittedOutput: output
   });
 
   json(
