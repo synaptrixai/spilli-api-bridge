@@ -62,8 +62,9 @@ Do:
   - Claude Code: `x-claude-code-session-id`.
 - Create or reuse sessions only through the bridge's tracked session maps before calling inference.
 - Call `runInference(...)` only with an explicit live `session` argument and the matching resolved model.
-- Send a complete prompt/query object on each `session.run({ prompt, query }, ...)` call.
-- Keep API/chat history outside the SpiLLI resource session and include it in prompt/query when needed.
+- Send full prompt/history only when creating or replacing a bridge-managed SpiLLI session.
+- For later append-only turns on the same bridge session key, send only the newly appended messages in `query` and leave `prompt` empty so the host-side session does not accumulate duplicate history.
+- Keep hashed history cursors in the bridge; do not keep a second full copy of chat history in memory.
 - Serialize `session.run()` calls per live resource session to avoid overlapping native stream callbacks.
 
 Do not:
@@ -78,7 +79,9 @@ Why this matters:
 
 - Resource-wide SDK session reuse caused cross-chat context leakage between separate Claude Code sessions.
 - Untracked `service.request(...)` calls from inside inference create orphan sessions that the bridge cannot map back to the correct chat/session key.
-- The correct workflow is: derive bridge session key -> get or create tracked session -> pass that session into `runInference(...)` -> keep chat history in the HTTP payload.
+- Re-sending the full client history to an already stateful SpiLLI host session causes repeated accumulation of the same turns.
+- The correct workflow is: derive bridge session key -> resolve the normalized history cursor -> create/reuse a tracked session -> pass the full history or append-only delta into `runInference(...)` -> commit the emitted assistant response to the cursor.
+- If the incoming history is not an append-only continuation, for example after compaction or rewrite, create a fresh SpiLLI session and seed it with the full incoming history.
 
 ## Anthropic/OpenAI Compatibility
 

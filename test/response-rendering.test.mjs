@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 
 import {
+  buildHistoryStateForAnthropic,
+  buildHistoryStateForOpenAiChat,
+  buildHistoryStateForResponses,
   extractHarmonyFinalText,
   mergePublicModels,
   normalizePublicCatalogModels,
+  prepareSessionRunPayload,
   parseToolCallsFromOutput,
   renderText,
   toResponsesOutputItems
@@ -137,5 +141,112 @@ assert.deepEqual(
   ],
   'merges backend public catalog models with host inventory and drops unlabeled hashed catalog-only models'
 );
+
+const liveSession = { isLive: () => true };
+const resourceKey = 'model|public|';
+
+const firstAnthropicHistory = buildHistoryStateForAnthropic({
+  model: 'spilli-test',
+  system: 'Be concise.',
+  messages: [{ role: 'user', content: 'Hello' }]
+});
+const firstPrepared = prepareSessionRunPayload(firstAnthropicHistory, undefined, resourceKey);
+assert.equal(firstPrepared.reused, false, 'first request creates a full-history run');
+assert.equal(firstPrepared.payload.prompt, firstAnthropicHistory.prompt);
+assert.equal(firstPrepared.payload.query, 'USER:\nHello');
+
+const secondAnthropicHistory = buildHistoryStateForAnthropic({
+  model: 'spilli-test',
+  system: 'Be concise.',
+  messages: [
+    { role: 'user', content: 'Hello' },
+    { role: 'assistant', content: 'Hi there' },
+    { role: 'user', content: 'Next question' }
+  ]
+});
+const previousAfterAssistant = {
+  session: liveSession,
+  promptHash: firstAnthropicHistory.promptHash,
+  resourceKey,
+  initialized: true,
+  historyHashes: secondAnthropicHistory.historyHashes.slice(0, 2)
+};
+const secondPrepared = prepareSessionRunPayload(secondAnthropicHistory, previousAfterAssistant, resourceKey);
+assert.equal(secondPrepared.reused, true, 'append-only request reuses the live session');
+assert.equal(secondPrepared.payload.prompt, '', 'append-only request does not resend the prompt');
+assert.equal(
+  secondPrepared.payload.query,
+  'USER:\nNext question',
+  'append-only request sends only the new user suffix'
+);
+
+const promptChangedHistory = buildHistoryStateForAnthropic({
+  model: 'spilli-test',
+  system: 'Be verbose.',
+  messages: [
+    { role: 'user', content: 'Hello' },
+    { role: 'assistant', content: 'Hi there' },
+    { role: 'user', content: 'Next question' }
+  ]
+});
+const promptChangedPrepared = prepareSessionRunPayload(promptChangedHistory, previousAfterAssistant, resourceKey);
+assert.equal(promptChangedPrepared.reused, false, 'prompt changes force a fresh full-history session');
+assert.equal(promptChangedPrepared.payload.prompt, promptChangedHistory.prompt);
+assert.equal(promptChangedPrepared.payload.query, promptChangedHistory.query);
+
+const compactedHistory = buildHistoryStateForAnthropic({
+  model: 'spilli-test',
+  system: 'Be concise.',
+  messages: [
+    { role: 'user', content: 'Summary of the previous chat' },
+    { role: 'user', content: 'Continue from there' }
+  ]
+});
+const compactedPrepared = prepareSessionRunPayload(compactedHistory, previousAfterAssistant, resourceKey);
+assert.equal(compactedPrepared.reused, false, 'rewritten or compacted history forces a fresh session');
+assert.equal(compactedPrepared.payload.query, compactedHistory.query);
+
+const openAiChatHistory = buildHistoryStateForOpenAiChat({
+  model: 'spilli-test',
+  messages: [
+    { role: 'system', content: 'System stays in the prompt.' },
+    { role: 'user', content: 'Question' },
+    { role: 'assistant', content: 'Answer' },
+    { role: 'user', content: 'Follow up' }
+  ]
+});
+assert.equal(openAiChatHistory.historyItems.length, 3, 'OpenAI chat history excludes system messages');
+assert.match(openAiChatHistory.prompt, /System stays in the prompt\./);
+
+const responsesArrayHistory = buildHistoryStateForResponses({
+  model: 'spilli-test',
+  instructions: 'Prefer short answers.',
+  input: [
+    { role: 'developer', content: [{ type: 'input_text', text: 'Hidden instruction' }] },
+    { role: 'user', content: [{ type: 'input_text', text: 'Visible question' }] }
+  ]
+});
+assert.equal(responsesArrayHistory.allowDelta, true, 'Responses array input can use append-only deltas');
+assert.equal(responsesArrayHistory.query, 'USER:\nVisible question');
+assert.match(responsesArrayHistory.prompt, /Hidden instruction/);
+
+const responsesStringHistory = buildHistoryStateForResponses({
+  model: 'spilli-test',
+  input: 'Opaque single input'
+});
+const responsesStringPrepared = prepareSessionRunPayload(
+  responsesStringHistory,
+  {
+    session: liveSession,
+    promptHash: responsesStringHistory.promptHash,
+    resourceKey,
+    initialized: true,
+    historyHashes: []
+  },
+  resourceKey
+);
+assert.equal(responsesStringHistory.allowDelta, false, 'Responses string input disables history diffing');
+assert.equal(responsesStringPrepared.reused, false, 'Responses string input starts a fresh full-history session');
+assert.equal(responsesStringPrepared.payload.query, 'USER:\nOpaque single input');
 
 console.log('response rendering tests passed');

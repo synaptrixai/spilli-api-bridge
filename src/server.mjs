@@ -1,4 +1,5 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import https from 'node:https';
 import os from 'node:os';
@@ -1540,24 +1541,76 @@ function formatToolsForPrompt(tools) {
   return lines.join('\n');
 }
 
-function anthropicToSpilliPayload(body) {
-  const systemPrompt = [normalizeSystem(body.system), formatToolsForPrompt(body.tools)].filter(Boolean).join('\n\n');
-  const query = Array.isArray(body.messages)
+function hashHistoryValue(value) {
+  return crypto.createHash('sha256').update(String(value ?? '')).digest('hex');
+}
+
+function messageText(role, content) {
+  const normalizedRole = asString(role || 'user').trim().toUpperCase() || 'USER';
+  return `${normalizedRole}:\n${content}`;
+}
+
+function createHistoryItem(role, content) {
+  const text = messageText(role, content);
+  return {
+    text,
+    hash: hashHistoryValue(text)
+  };
+}
+
+function createHistoryState({ requestedModel, prompt, historyItems, allowDelta = true }) {
+  const items = Array.isArray(historyItems) ? historyItems.filter(item => item?.text) : [];
+  return {
+    requestedModel: asString(requestedModel).trim(),
+    prompt: asString(prompt),
+    promptHash: hashHistoryValue(asString(prompt)),
+    historyItems: items,
+    historyHashes: items.map(item => item.hash),
+    allowDelta,
+    query: items.map(item => item.text).join('\n\n')
+  };
+}
+
+function normalizeOpenAiChatMessageContent(message) {
+  const parts = [normalizeContent(message?.content)];
+  if (Array.isArray(message?.tool_calls)) {
+    for (const call of message.tool_calls) {
+      if (!isRecord(call)) {
+        continue;
+      }
+      const functionName = asString(call.function?.name).trim() || 'function';
+      const args = asString(call.function?.arguments).trim();
+      parts.push(`Tool call ${functionName}(${args})`);
+    }
+  }
+  return parts.filter(Boolean).join('\n');
+}
+
+function buildHistoryStateForAnthropic(body) {
+  const prompt = [normalizeSystem(body.system), formatToolsForPrompt(body.tools)].filter(Boolean).join('\n\n');
+  const historyItems = Array.isArray(body.messages)
     ? body.messages
         .map(message => {
           if (!isRecord(message)) {
-            return '';
+            return undefined;
           }
-          const role = asString(message.role) || 'user';
-          return `${role.toUpperCase()}:\n${normalizeContent(message.content)}`;
+          return createHistoryItem(asString(message.role) || 'user', normalizeContent(message.content));
         })
         .filter(Boolean)
-        .join('\n\n')
-    : '';
+    : [];
+  return createHistoryState({
+    requestedModel: body.model,
+    prompt,
+    historyItems
+  });
+}
+
+function anthropicToSpilliPayload(body) {
+  const historyState = buildHistoryStateForAnthropic(body);
   return {
-    requestedModel: asString(body.model).trim(),
-    prompt: systemPrompt,
-    query
+    requestedModel: historyState.requestedModel,
+    prompt: historyState.prompt,
+    query: historyState.query
   };
 }
 
@@ -1566,8 +1619,17 @@ function estimateTokens(text) {
 }
 
 function openAiToSpilliPayload(body) {
+  const historyState = buildHistoryStateForOpenAiChat(body);
+  return {
+    requestedModel: historyState.requestedModel,
+    prompt: historyState.prompt,
+    query: historyState.query
+  };
+}
+
+function buildHistoryStateForOpenAiChat(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const systemPrompt = [
+  const prompt = [
     messages
       .filter(message => isRecord(message) && message.role === 'system')
       .map(message => normalizeContent(message.content))
@@ -1577,16 +1639,14 @@ function openAiToSpilliPayload(body) {
   ]
     .filter(Boolean)
     .join('\n\n');
-  const query = messages
+  const historyItems = messages
     .filter(message => isRecord(message) && message.role !== 'system')
-    .map(message => `${asString(message.role || 'user').toUpperCase()}:\n${normalizeContent(message.content)}`)
-    .filter(Boolean)
-    .join('\n\n');
-  return {
-    requestedModel: asString(body.model).trim(),
-    prompt: systemPrompt,
-    query
-  };
+    .map(message => createHistoryItem(asString(message.role || 'user'), normalizeOpenAiChatMessageContent(message)));
+  return createHistoryState({
+    requestedModel: body.model,
+    prompt,
+    historyItems
+  });
 }
 
 function stripEogMarkers(value) {
@@ -1646,6 +1706,67 @@ function buildResource(resolvedModel, config) {
   return resource;
 }
 
+function historyHashesHavePrefix(historyHashes, prefixHashes) {
+  if (!Array.isArray(historyHashes) || !Array.isArray(prefixHashes)) {
+    return false;
+  }
+  if (prefixHashes.length > historyHashes.length) {
+    return false;
+  }
+  for (let index = 0; index < prefixHashes.length; index += 1) {
+    if (historyHashes[index] !== prefixHashes[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function createRunPayloadFromHistory(historyState, historyItems, includePrompt) {
+  return {
+    requestedModel: historyState.requestedModel,
+    prompt: includePrompt ? historyState.prompt : '',
+    query: historyItems.map(item => item.text).join('\n\n')
+  };
+}
+
+function prepareSessionRunPayload(historyState, previousEntry, resourceKey) {
+  const previousHashes = previousEntry?.historyHashes ?? [];
+  const canReuse =
+    previousEntry?.initialized === true &&
+    previousEntry?.session?.isLive?.() &&
+    previousEntry.promptHash === historyState.promptHash &&
+    previousEntry.resourceKey === resourceKey &&
+    historyState.allowDelta &&
+    historyHashesHavePrefix(historyState.historyHashes, previousHashes);
+  const historyItems = canReuse
+    ? historyState.historyItems.slice(previousHashes.length)
+    : historyState.historyItems;
+  return {
+    reused: Boolean(canReuse),
+    reason: canReuse ? 'append' : previousEntry?.session?.isLive?.() ? 'replace' : 'new',
+    payload: createRunPayloadFromHistory(historyState, historyItems, !canReuse)
+  };
+}
+
+function assistantHistoryItemForAnthropic(message) {
+  return createHistoryItem('assistant', normalizeContent(message?.content));
+}
+
+function assistantHistoryItemForOpenAiChat(message) {
+  return createHistoryItem('assistant', normalizeOpenAiChatMessageContent(message));
+}
+
+function assistantHistoryItemsForResponses(output) {
+  return Array.isArray(output)
+    ? output
+        .map(item => {
+          const text = responsesInputItemToText(item);
+          return text ? { text, hash: hashHistoryValue(text) } : undefined;
+        })
+        .filter(Boolean)
+    : [];
+}
+
 async function withResourceRunQueue(resource, callback) {
   const key = resourceCacheKey(resource);
   const previous = state.resourceRunQueues.get(key) ?? Promise.resolve();
@@ -1688,25 +1809,57 @@ async function runInference({ requestedModel, prompt, query }, config, streamOpt
   });
 }
 
-async function getOrCreateClientSession(req, payload, config) {
+async function getOrCreateClientSession(req, historyState, config) {
   const sessionKey = getSpilliSessionKey(req);
   const service = getService(config);
-  const resolvedModel = await resolveRequestedModel(payload.requestedModel, config);
+  const resolvedModel = await resolveRequestedModel(historyState.requestedModel, config);
   const resource = buildResource(resolvedModel, config);
+  const resourceKey = resourceCacheKey(resource);
+  const previousEntry = sessionKey ? state.chatSessions.get(sessionKey) : undefined;
+  const prepared = prepareSessionRunPayload(historyState, previousEntry, resourceKey);
 
+  const chosenSession = prepared.reused
+    ? previousEntry.session
+    : await service.request(resource, config.requestTimeoutMs);
   if (sessionKey) {
-    const chosenSession = state.chatSessions.get(sessionKey)?.session;
-    if (chosenSession?.isLive?.()) {
-      return { sessionKey, chosenSession, resolvedModel };
+    if (prepared.reused) {
+      state.chatSessions.set(sessionKey, previousEntry);
+    } else {
+      state.chatSessions.set(sessionKey, {
+        session: chosenSession,
+        promptHash: historyState.promptHash,
+        historyHashes: [],
+        resourceKey,
+        initialized: false
+      });
     }
   }
 
-  const chosenSession = await service.request(resource, config.requestTimeoutMs);
-  if (sessionKey) {
-    state.chatSessions.set(sessionKey, { session: chosenSession });
-  }
+  const commitHistory = (assistantItems = []) => {
+    if (!sessionKey) {
+      return;
+    }
+    const current = state.chatSessions.get(sessionKey);
+    if (current?.session !== chosenSession) {
+      return;
+    }
+    state.chatSessions.set(sessionKey, {
+      ...current,
+      initialized: true,
+      historyHashes: [
+        ...historyState.historyHashes,
+        ...assistantItems.map(item => item.hash).filter(Boolean)
+      ]
+    });
+  };
 
-  return { sessionKey, chosenSession, resolvedModel };
+  return {
+    sessionKey,
+    chosenSession,
+    resolvedModel,
+    payload: prepared.payload,
+    commitHistory
+  };
 }
 
 function json(res, statusCode, payload, headers = {}) {
@@ -2113,7 +2266,8 @@ function buildAnthropicRetryPayload(payload, allowedToolNames) {
   ].join('\n');
   return {
     ...payload,
-    prompt: [payload.prompt, repairPrompt].filter(Boolean).join('\n\n')
+    prompt: repairPrompt,
+    query: ''
   };
 }
 
@@ -2155,9 +2309,10 @@ function writeSse(res, event, data) {
 
 async function handleAnthropicMessages(req, res, config) {
   const body = await readBody(req);
-  const payload = anthropicToSpilliPayload(body);
-  await logClaudeRequestShape(req, body, payload);
-  const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
+  const historyState = buildHistoryStateForAnthropic(body);
+  const fullPayload = anthropicToSpilliPayload(body);
+  await logClaudeRequestShape(req, body, fullPayload);
+  const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
   const allowedToolNames = extractAvailableToolNames(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
@@ -2252,6 +2407,7 @@ async function handleAnthropicMessages(req, res, config) {
       const emittedMessage = rawMode
         ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
         : message;
+      commitHistory([assistantHistoryItemForAnthropic(emittedMessage)]);
       // await logInferenceResponse('anthropic.messages.response', {
       //   id,
       //   stream: true,
@@ -2333,6 +2489,7 @@ async function handleAnthropicMessages(req, res, config) {
   const emittedMessage = rawMode
     ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
     : message;
+  commitHistory([assistantHistoryItemForAnthropic(emittedMessage)]);
   // await logInferenceResponse('anthropic.messages.response', {
   //   id,
   //   stream: false,
@@ -2405,19 +2562,20 @@ function toOpenAiChatCompletion({
 
 async function handleOpenAiChatCompletions(req, res, config) {
   const body = await readBody(req);
-  const payload = openAiToSpilliPayload(body);
+  const historyState = buildHistoryStateForOpenAiChat(body);
+  const fullPayload = openAiToSpilliPayload(body);
   const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   const allowedToolNames = extractAvailableToolNames(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
-  await logInferenceRequest('openai.chat_completions', req, body, payload, {
+  await logInferenceRequest('openai.chat_completions', req, body, fullPayload, {
     requestId: id,
     allowedToolNames,
     toolsEnabled,
     responseMode: config.responseMode
   });
   const created = Math.floor(Date.now() / 1000);
-  const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
+  const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
   if (body.stream === true) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -2471,6 +2629,7 @@ async function handleOpenAiChatCompletions(req, res, config) {
         allowedToolNames,
         responseMode: config.responseMode
       });
+      commitHistory([assistantHistoryItemForOpenAiChat(completion.choices[0]?.message)]);
       await logInferenceResponse('openai.chat_completions.response', {
         id,
         stream: true,
@@ -2558,6 +2717,7 @@ async function handleOpenAiChatCompletions(req, res, config) {
     allowedToolNames,
     responseMode: config.responseMode
   });
+  commitHistory([assistantHistoryItemForOpenAiChat(completion.choices[0]?.message)]);
   await logInferenceResponse('openai.chat_completions.response', {
     id,
     stream: false,
@@ -2689,6 +2849,15 @@ function responsesInputItemToText(item) {
 }
 
 function responsesToSpilliPayload(body) {
+  const historyState = buildHistoryStateForResponses(body);
+  return {
+    requestedModel: historyState.requestedModel,
+    prompt: historyState.prompt,
+    query: historyState.query
+  };
+}
+
+function buildHistoryStateForResponses(body) {
   const input = body.input;
   const inputItems = Array.isArray(input) ? input : [];
 
@@ -2703,12 +2872,6 @@ function responsesToSpilliPayload(body) {
     .filter(Boolean)
     .join('\n\n');
 
-  const queryFromInputItems = inputItems
-    .filter((item) => !isInstructionItem(item))
-    .map(responsesInputItemToText)
-    .filter(Boolean)
-    .join('\n\n');
-
   const prompt = [
     asString(body.instructions).trim(),
     promptFromInputItems,
@@ -2717,16 +2880,23 @@ function responsesToSpilliPayload(body) {
     .filter(Boolean)
     .join('\n\n');
 
-  const query =
+  const historyItems =
     typeof input === 'string'
-      ? `USER:\n${input}`
-      : queryFromInputItems;
+      ? [createHistoryItem('user', input)]
+      : inputItems
+          .filter((item) => !isInstructionItem(item))
+          .map((item) => {
+            const text = responsesInputItemToText(item);
+            return text ? { text, hash: hashHistoryValue(text) } : undefined;
+          })
+          .filter(Boolean);
 
-  return {
-    requestedModel: asString(body.model).trim(),
+  return createHistoryState({
+    requestedModel: body.model,
     prompt,
-    query
-  };
+    historyItems,
+    allowDelta: typeof input !== 'string'
+  });
 }
 
 function createResponseId(prefix = 'resp') {
@@ -2885,7 +3055,8 @@ function writeResponsesSse(res, event) {
 
 async function handleOpenAiResponses(req, res, config) {
   const body = await readBody(req);
-  const payload = responsesToSpilliPayload(body);
+  const historyState = buildHistoryStateForResponses(body);
+  const fullPayload = responsesToSpilliPayload(body);
   const id = createResponseId('resp');
   const createdAt = Math.floor(Date.now() / 1000);
   const messageId = createResponseId('msg');
@@ -2894,7 +3065,7 @@ async function handleOpenAiResponses(req, res, config) {
   const toolTypes = extractResponsesToolTypes(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
-  await logInferenceRequest('openai.responses', req, body, payload, {
+  await logInferenceRequest('openai.responses', req, body, fullPayload, {
     requestId: id,
     // allowedToolNames,
     // toolsEnabled,
@@ -2910,7 +3081,7 @@ async function handleOpenAiResponses(req, res, config) {
     });
 
     let sequenceNumber = 1;
-    let streamModel = payload.requestedModel || asString(body.model).trim() || 'spilli';
+    let streamModel = fullPayload.requestedModel || asString(body.model).trim() || 'spilli';
     let rawForStream = '';
     let streamedText = '';
 
@@ -2970,7 +3141,7 @@ async function handleOpenAiResponses(req, res, config) {
         type: 'response.created',
         response: created
       });
-      const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
+      const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
       const result = await runInference(payload, config, {
         onStart: ({ requestedModel }) => {
           streamModel = requestedModel || streamModel;
@@ -3011,6 +3182,7 @@ async function handleOpenAiResponses(req, res, config) {
         messageId,
         responseMode: config.responseMode
       });
+      commitHistory(assistantHistoryItemsForResponses(output));
 
       await logInferenceResponse('openai.responses.response', {
         id,
@@ -3104,7 +3276,7 @@ async function handleOpenAiResponses(req, res, config) {
         route: 'openai.responses',
         request_id: id,
         response_mode: config.responseMode,
-        requested_model: payload.requestedModel || null
+        requested_model: fullPayload.requestedModel || null
       });
       const failed = createResponsesObject({
         id,
@@ -3132,7 +3304,7 @@ async function handleOpenAiResponses(req, res, config) {
 
     return;
   }
-  const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
+  const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
   const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
 
   const { output, toolCalls } = toResponsesOutputItems({
@@ -3142,6 +3314,7 @@ async function handleOpenAiResponses(req, res, config) {
     toolTypes,
     responseMode: config.responseMode
   });
+  commitHistory(assistantHistoryItemsForResponses(output));
 
   await logInferenceResponse('openai.responses.response', {
     id,
@@ -3271,9 +3444,13 @@ const server = http.createServer((req, res) => {
 });
 
 export {
+  buildHistoryStateForAnthropic,
+  buildHistoryStateForOpenAiChat,
+  buildHistoryStateForResponses,
   extractHarmonyFinalText,
   mergePublicModels,
   normalizePublicCatalogModels,
+  prepareSessionRunPayload,
   parseToolCallsFromOutput,
   renderText,
   toResponsesOutputItems
