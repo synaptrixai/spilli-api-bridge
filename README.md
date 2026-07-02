@@ -78,7 +78,6 @@ services:
       SPILLI_BRIDGE_REQUEST_TIMEOUT_MS: ${SPILLI_BRIDGE_REQUEST_TIMEOUT_MS:-600000}
       SPILLI_BRIDGE_MODEL_CACHE_TTL_MS: ${SPILLI_BRIDGE_MODEL_CACHE_TTL_MS:-30000}
       SPILLI_BRIDGE_RESPONSE_MODE: ${SPILLI_BRIDGE_RESPONSE_MODE:-compat}
-      SPILLI_BRIDGE_REUSE_SESSIONS: ${SPILLI_BRIDGE_REUSE_SESSIONS:-1}
     volumes:
       - ${SPILLI_PEM_DIR:-${HOME}/.spilli}:/home/node/.spilli:ro
 ```
@@ -141,8 +140,9 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_BRIDGE_RESPONSE_MODE`: response conversion mode, default `raw`.
   - `raw`: return SpiLLI model text as assistant text and do not infer tool calls.
   - `compat`: parse Harmony/JSON tool-call text into Anthropic/OpenAI tool-call objects for clients that need API-native tool calls.
-- `SPILLI_BRIDGE_REUSE_SESSIONS`: set to `0` to force a fresh SpiLLI resource request for troubleshooting. Defaults to `1`, reusing the acquired network resource/session by model/scope while keeping chat history in each request payload.
 - `SPILLI_BRIDGE_NATIVE_CACHE_DIR`: optional native binary cache directory.
+- `SPILLI_BRIDGE_TRACE_REQUEST_SHAPES`: set to `1` to write sanitized request-shape traces for local debugging. This logs headers and payload structure only, not prompt text or model responses.
+- `SPILLI_BRIDGE_REQUEST_LOG_PATH`: optional path for the trace file. Defaults to `~/.spilli/spilli-api-bridge-requests.jsonl`.
 
 ## Dynamic Models
 

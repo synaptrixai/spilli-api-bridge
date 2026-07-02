@@ -41,43 +41,53 @@ const state = {
   chatSessions: new Map()
 };
 
-/**
- * Helper to determine a unique SpiLLI session key based on Codex request metadata.
- * The `x-codex-turn-metadata` header contains JSON with `window_id`, `session_id`
- * and `thread_id`. These three values are concatenated into a deterministic
- * string. If a session for that key already exists in {@link state.chatSessions}
- * it is reused; otherwise the key itself is used as the new session identifier.
- *
- * @param {import('node:http').IncomingMessage} req - HTTP request
- * @returns {string|null} Session key or null if metadata missing/invalid
- */
-function getSpilliSessionKey(req,body) {
+function getNamespacedSessionKey(prefix, key) {
+  const normalized = typeof key === 'string' ? key.trim() : '';
+  return normalized ? `${prefix}:${normalized}` : undefined;
+}
+
+function getCodexSessionKey(req) {
   const metaHeader = req.headers['x-codex-turn-metadata'];
-  // console.log('metaHeaders: ',metaHeader)
-  // console.log('body meta: ',body.client_metadata["x-codex-turn-metadata"])
-  if (!metaHeader){ 
-    // console.log('codex turn metadata missing')
-    return 'default';
+  if (!metaHeader) {
+    return undefined;
   }
 
   let meta;
   try {
     meta = typeof metaHeader === 'string' ? JSON.parse(metaHeader) : metaHeader;
   } catch {
-    // console.log('error parsing metadata')
-    return null;
+    return undefined;
   }
-  const window_id = meta['window_id']
-  const session_id = meta['session_id']
-  const thread_id = meta['thread_id']
-  // const { window_id, session_id, thread_id } = meta || {};
-  if (!window_id || !session_id || !thread_id){ 
-    // console.log('returning default')
-    return 'default';}
-  
-  const key = `${window_id}:${session_id}:${thread_id}`;
-  // console.log('session key: ',key)
-  return key;
+
+  const windowId = asString(meta?.window_id).trim();
+  const sessionId = asString(meta?.session_id).trim();
+  const threadId = asString(meta?.thread_id).trim();
+  if (!windowId || !sessionId || !threadId) {
+    return undefined;
+  }
+
+  return getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
+}
+
+function getClaudeSessionKey(req) {
+  return getNamespacedSessionKey('claude', asString(req.headers['x-claude-code-session-id']));
+}
+
+/**
+ * Determine a client session key from request metadata when the client exposes one.
+ *
+ * Codex provides `x-codex-turn-metadata` with `window_id`, `session_id`, and
+ * `thread_id`. Claude Code provides `x-claude-code-session-id`.
+ *
+ * @param {import('node:http').IncomingMessage} req - HTTP request
+ * @returns {string|undefined} Session key when present
+ */
+function getSpilliSessionKey(req) {
+  return getCodexSessionKey(req) ?? getClaudeSessionKey(req);
+}
+
+function getResponseChainSessionKey(responseId) {
+  return getNamespacedSessionKey('response', responseId);
 }
 
 
@@ -223,7 +233,6 @@ function getConfig() {
     requestTimeoutMs: Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0 ? requestTimeoutMs : DEFAULT_TIMEOUT_MS,
     modelCacheTtlMs:
       Number.isFinite(modelCacheTtlMs) && modelCacheTtlMs > 0 ? modelCacheTtlMs : DEFAULT_MODEL_CACHE_TTL_MS,
-    reuseSessions: readEnv('SPILLI_BRIDGE_REUSE_SESSIONS', '1') !== '0',
     nativeCacheDir: readEnv('SPILLI_BRIDGE_NATIVE_CACHE_DIR'),
     modelAliases: parseModelAliases(readEnv('SPILLI_BRIDGE_MODEL_ALIASES')),
     responseMode: normalizeResponseMode(readEnv('SPILLI_BRIDGE_RESPONSE_MODE', 'raw'))
@@ -1485,6 +1494,14 @@ function resourceCacheKey(resource) {
   return `${resource.model}|${resource.scope ?? ''}|${resource.team ?? ''}`;
 }
 
+function buildResource(resolvedModel, config) {
+  const resource = { model: resolvedModel.uid, scope: config.scope };
+  if (config.team) {
+    resource.team = config.team;
+  }
+  return resource;
+}
+
 async function withResourceRunQueue(resource, callback) {
   const key = resourceCacheKey(resource);
   const previous = state.resourceRunQueues.get(key) ?? Promise.resolve();
@@ -1501,23 +1518,12 @@ async function withResourceRunQueue(resource, callback) {
 
 // Run inference using an already created SpiLLI session.
 async function runInference({ requestedModel, prompt, query }, config, streamOptions = {}, session, resolvedModelOverride) {
-  // console.log('requested model: ',requestedModel)
   const resolvedModel = resolvedModelOverride ?? await resolveRequestedModel(requestedModel, config);
-  // console.log('resolved model: ',resolvedModel)
-  // const service = getService(config);
-  const resource = { model: resolvedModel.uid, scope: config.scope };
-  if (config.team) {
-    resource.team = config.team;
-  }
+  const resource = buildResource(resolvedModel, config);
   const apiModelName = requestedModel || resolvedModel.displayName;
-  // if (!session || !session.isLive()) {
-  //   session = service.request(resource, config.requestTimeoutMs);
-  // }
   return withResourceRunQueue(resource, async () => {
-    // if (!session.isLive()) {
-    //   session = service.request(resource, config.requestTimeoutMs);
-    // }
-    if (!session || !session.isLive()) {
+    const activeSession = session?.isLive?.() ? session : undefined;
+    if (!activeSession?.isLive?.()) {
       throw Object.assign(new Error('SpiLLI model session is not live.'), { statusCode: 503 });
     }
     streamOptions.onStart?.({ requestedModel: apiModelName, resolvedModel });
@@ -1527,38 +1533,31 @@ async function runInference({ requestedModel, prompt, query }, config, streamOpt
     if (streamForwarder) {
       runOptions.onChunk = chunk => streamForwarder.onChunk(chunk);
     }
-    const raw = stripEogMarkers(await session.run({ prompt, query }, runOptions));
+    const raw = stripEogMarkers(await activeSession.run({ prompt, query }, runOptions));
     streamForwarder?.flush();
     return {
       raw,
       requestedModel: apiModelName,
-      resolvedModel
+      resolvedModel,
+      session: activeSession
     };
   });
 }
 
-async function getOrCreateResponseSession(req, body, payload, config) {
-  const sessionKey = getSpilliSessionKey(req, body);
+async function getOrCreateClientSession(req, payload, config) {
+  const sessionKey = getSpilliSessionKey(req);
   const service = getService(config);
   const resolvedModel = await resolveRequestedModel(payload.requestedModel, config);
-  const resource = { model: resolvedModel.uid, scope: config.scope };
-  if (config.team) {
-    resource.team = config.team;
+  const resource = buildResource(resolvedModel, config);
+
+  if (sessionKey) {
+    const chosenSession = state.chatSessions.get(sessionKey)?.session;
+    if (chosenSession?.isLive?.()) {
+      return { sessionKey, chosenSession, resolvedModel };
+    }
   }
 
-  let chosenSession = sessionKey ? state.chatSessions.get(sessionKey)?.session : undefined;
-  if (chosenSession?.isLive?.()) {
-    // console.log('Reuse session: ', chosenSession);
-    return { sessionKey, chosenSession, resolvedModel };
-  }
-
-  // if (sessionKey && chosenSession) {
-  //   console.log('Cached session is not live, creating a new session for key: ', sessionKey);
-  // } else {
-  //   console.log('Create session: ', sessionKey);
-  // }
-
-  chosenSession = await service.request(resource, config.requestTimeoutMs);
+  const chosenSession = await service.request(resource, config.requestTimeoutMs);
   if (sessionKey) {
     state.chatSessions.set(sessionKey, { session: chosenSession });
   }
@@ -1654,6 +1653,115 @@ function sanitizeForLog(value, depth = 0) {
 
 function getRequestLogPath() {
   return readEnv('SPILLI_BRIDGE_REQUEST_LOG_PATH', DEFAULT_REQUEST_LOG_PATH);
+}
+
+function isRequestTraceEnabled() {
+  return readEnv('SPILLI_BRIDGE_TRACE_REQUEST_SHAPES', '0') === '1';
+}
+
+function summarizeAnthropicContentShape(content) {
+  if (typeof content === 'string') {
+    return {
+      kind: 'string',
+      length: content.length
+    };
+  }
+  if (!Array.isArray(content)) {
+    return {
+      kind: typeof content
+    };
+  }
+  return {
+    kind: 'array',
+    parts: content.map((part, index) => {
+      if (!isRecord(part)) {
+        return { index, type: typeof part };
+      }
+      const summary = {
+        index,
+        type: asString(part.type) || 'unknown'
+      };
+      if (typeof part.text === 'string') {
+        summary.textLength = part.text.length;
+      }
+      if (typeof part.name === 'string') {
+        summary.name = part.name;
+      }
+      if (typeof part.id === 'string') {
+        summary.id = part.id;
+      }
+      if (isRecord(part.input)) {
+        summary.inputKeys = Object.keys(part.input).sort();
+      }
+      if (isRecord(part.result)) {
+        summary.resultKeys = Object.keys(part.result).sort();
+      }
+      if (typeof part.tool_use_id === 'string') {
+        summary.toolUseId = part.tool_use_id;
+      }
+      return summary;
+    })
+  };
+}
+
+function summarizeAnthropicMessageShape(message, index) {
+  if (!isRecord(message)) {
+    return {
+      index,
+      type: typeof message
+    };
+  }
+  return {
+    index,
+    role: asString(message.role) || 'unknown',
+    content: summarizeAnthropicContentShape(message.content)
+  };
+}
+
+function summarizeClaudeRequestHeaders(req) {
+  const summary = {};
+  for (const [name, value] of Object.entries(req.headers)) {
+    const sanitized = sanitizeForLog(value);
+    if (typeof sanitized === 'string' && sanitized) {
+      summary[name] = sanitized;
+    } else if (Array.isArray(sanitized) && sanitized.length > 0) {
+      summary[name] = sanitized;
+    }
+  }
+  return summary;
+}
+
+async function logClaudeRequestShape(req, body, payload) {
+  if (!isRequestTraceEnabled()) {
+    return;
+  }
+  const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+  await appendLog(
+    {
+      timestamp: new Date().toISOString(),
+      kind: 'anthropic.messages.shape',
+      method: req.method,
+      path: url.pathname,
+      headers: summarizeClaudeRequestHeaders(req),
+      request: {
+        model: asString(body.model) || null,
+        stream: body.stream === true,
+        max_tokens: Number.isFinite(body.max_tokens) ? body.max_tokens : null,
+        systemShape: summarizeAnthropicContentShape(body.system),
+        toolNames: extractAvailableToolNames(body.tools),
+        toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+        messages: Array.isArray(body.messages)
+          ? body.messages.map((message, index) => summarizeAnthropicMessageShape(message, index))
+          : []
+      },
+      bridge: {
+        requestedModel: payload.requestedModel,
+        promptLength: payload.prompt.length,
+        queryLength: payload.query.length
+      }
+    },
+    'TRACE'
+  );
 }
 
 async function appendLog(entry,label) {
@@ -1821,7 +1929,13 @@ function buildAnthropicRetryPayload(payload, allowedToolNames) {
 }
 
 async function runAnthropicInferenceWithRetry(payload, config, options) {
-  let result = await runInference(payload, config, options?.streamOptions ?? {});
+  let result = await runInference(
+    payload,
+    config,
+    options?.streamOptions ?? {},
+    options?.session,
+    options?.resolvedModel
+  );
   let message = toAnthropicMessage({
     id: options.id,
     model: result.requestedModel,
@@ -1833,7 +1947,7 @@ async function runAnthropicInferenceWithRetry(payload, config, options) {
   if (shouldRetryEmptyAnthropicTurn(message, result.raw)) {
     retried = true;
     const retryPayload = buildAnthropicRetryPayload(payload, options.allowedToolNames);
-    result = await runInference(retryPayload, config);
+    result = await runInference(retryPayload, config, {}, result.session, result.resolvedModel);
     message = toAnthropicMessage({
       id: options.id,
       model: result.requestedModel,
@@ -1853,6 +1967,8 @@ function writeSse(res, event, data) {
 async function handleAnthropicMessages(req, res, config) {
   const body = await readBody(req);
   const payload = anthropicToSpilliPayload(body);
+  await logClaudeRequestShape(req, body, payload);
+  const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
   const allowedToolNames = extractAvailableToolNames(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
@@ -1932,7 +2048,7 @@ async function handleAnthropicMessages(req, res, config) {
       }
       const { result, message, retried } = rawMode
         ? {
-            result: await runInference(payload, config, streamOptions),
+            result: await runInference(payload, config, streamOptions, chosenSession, resolvedModel),
             message: undefined,
             retried: false
           }
@@ -1940,7 +2056,9 @@ async function handleAnthropicMessages(req, res, config) {
             id,
             toolsEnabled,
             allowedToolNames,
-            streamOptions
+            streamOptions,
+            session: chosenSession,
+            resolvedModel
           });
       const emittedMessage = rawMode
         ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
@@ -2006,14 +2124,16 @@ async function handleAnthropicMessages(req, res, config) {
   }
   const { result, message, retried } = rawMode
     ? {
-        result: await runInference(payload, config),
+        result: await runInference(payload, config, {}, chosenSession, resolvedModel),
         message: undefined,
         retried: false
       }
     : await runAnthropicInferenceWithRetry(payload, config, {
         id,
         toolsEnabled,
-        allowedToolNames
+        allowedToolNames,
+        session: chosenSession,
+        resolvedModel
       });
   const emittedMessage = rawMode
     ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
@@ -2105,14 +2225,15 @@ async function handleOpenAiChatCompletions(req, res, config) {
   // Determine which session should be used based on chaining.
   const previousResponseId = body.previous_response_id || undefined;
   let chosenSession;
-  if (previousResponseId && state.chatSessions.has(previousResponseId)) {
-    chosenSession = state.chatSessions.get(previousResponseId).session;
+  let resolvedModel;
+  const previousResponseKey = getResponseChainSessionKey(previousResponseId);
+  if (previousResponseKey && state.chatSessions.has(previousResponseKey)) {
+    chosenSession = state.chatSessions.get(previousResponseKey).session;
   } else {
-    // Fall back to normal runInference logic which will create a new session.
-    const result = await runInference(payload, config);
-    // After we have the inference results we can record the session for future
-    // chaining. The actual response id is generated by our caller (id variable).
-    state.chatSessions.set(id, {session: result.session});
+    ({ chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config));
+  }
+  if (!resolvedModel) {
+    resolvedModel = await resolveRequestedModel(payload.requestedModel, config);
   }
   if (body.stream === true) {
     res.writeHead(200, {
@@ -2158,7 +2279,8 @@ async function handleOpenAiChatCompletions(req, res, config) {
             choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
           })}\n\n`);
         }
-      });
+      }, chosenSession, resolvedModel);
+      state.chatSessions.set(getResponseChainSessionKey(id), { session: result.session });
       const completion = toOpenAiChatCompletion({
         id,
         model: result.requestedModel,
@@ -2239,7 +2361,8 @@ async function handleOpenAiChatCompletions(req, res, config) {
     }
     return;
   }
-  const result = await runInference(payload, config);
+  const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
+  state.chatSessions.set(getResponseChainSessionKey(id), { session: result.session });
   const completion = toOpenAiChatCompletion({
     id,
     model: result.requestedModel,
@@ -2661,7 +2784,7 @@ async function handleOpenAiResponses(req, res, config) {
         type: 'response.created',
         response: created
       });
-      const { chosenSession, resolvedModel } = await getOrCreateResponseSession(req, body, payload, config);
+      const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
       const result = await runInference(payload, config, {
         onStart: ({ requestedModel }) => {
           streamModel = requestedModel || streamModel;
@@ -2817,7 +2940,7 @@ async function handleOpenAiResponses(req, res, config) {
 
     return;
   }
-  const { chosenSession, resolvedModel } = await getOrCreateResponseSession(req, body, payload, config);
+  const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
   const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
 
   const { output, toolCalls } = toResponsesOutputItems({
