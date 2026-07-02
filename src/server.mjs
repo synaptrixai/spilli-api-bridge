@@ -1572,8 +1572,9 @@ function json(res, statusCode, payload, headers = {}) {
   res.end(body);
 }
 
-function errorJson(res, err) {
+function errorJson(req, res, err) {
   const status = Number.isInteger(err?.statusCode) ? err.statusCode : 500;
+  void logApiError(req, err);
   json(res, status, {
     error: {
       type: status === 401 ? 'authentication_error' : 'api_error',
@@ -1649,6 +1650,50 @@ function sanitizeForLog(value, depth = 0) {
 
 function getRequestLogPath() {
   return readEnv('SPILLI_BRIDGE_REQUEST_LOG_PATH', DEFAULT_REQUEST_LOG_PATH);
+}
+
+function summarizeRequestForError(req) {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+  return {
+    method: req.method,
+    path: url.pathname,
+    headers: {
+      'user-agent': asString(req.headers['user-agent']) || null,
+      'x-app': asString(req.headers['x-app']) || null,
+      'anthropic-version': asString(req.headers['anthropic-version']) || null,
+      'anthropic-beta': asString(req.headers['anthropic-beta']) || null,
+      'x-claude-code-session-id': asString(req.headers['x-claude-code-session-id']) || null,
+      'x-codex-turn-metadata': sanitizeForLog(req.headers['x-codex-turn-metadata']) ?? null,
+      'x-openai-subagent': asString(req.headers['x-openai-subagent']) || null
+    },
+    session_key: getSpilliSessionKey(req) ?? null
+  };
+}
+
+function errorSummary(err) {
+  return {
+    statusCode: Number.isInteger(err?.statusCode) ? err.statusCode : 500,
+    message: err instanceof Error ? err.message : String(err),
+    name: err instanceof Error ? err.name : typeof err,
+    stack: err instanceof Error ? err.stack?.split('\n').slice(0, 6) : undefined,
+    context: isRecord(err?.context) ? sanitizeForLog(err.context) : undefined
+  };
+}
+
+async function logApiError(req, err, extra = {}) {
+  const summary = errorSummary(err);
+  const request = summarizeRequestForError(req);
+  const entry = {
+    timestamp: new Date().toISOString(),
+    kind: 'api.error',
+    request,
+    error: summary,
+    ...extra
+  };
+  console.error(
+    `[SpiLLI API bridge] ${request.method} ${request.path} failed (${summary.statusCode}): ${summary.message}`
+  );
+  await appendLog(entry, 'ERROR');
 }
 
 function isRequestTraceEnabled() {
@@ -2108,6 +2153,12 @@ async function handleAnthropicMessages(req, res, config) {
       writeSse(res, 'message_stop', { type: 'message_stop' });
       res.end();
     } catch (err) {
+      await logApiError(req, err, {
+        route: 'anthropic.messages',
+        request_id: id,
+        response_mode: config.responseMode,
+        requested_model: payload.requestedModel || null
+      });
       writeSse(res, 'error', {
         type: 'error',
         error: { type: 'api_error', message: err instanceof Error ? err.message : String(err) }
@@ -2336,6 +2387,12 @@ async function handleOpenAiChatCompletions(req, res, config) {
       res.write('data: [DONE]\n\n');
       res.end();
     } catch (err) {
+      await logApiError(req, err, {
+        route: 'openai.chat_completions',
+        request_id: id,
+        response_mode: config.responseMode,
+        requested_model: payload.requestedModel || null
+      });
       res.write(`data: ${JSON.stringify({
         error: { type: 'api_error', message: err instanceof Error ? err.message : String(err) }
       })}\n\n`);
@@ -2895,6 +2952,12 @@ async function handleOpenAiResponses(req, res, config) {
 
       res.end();
     } catch (err) {
+      await logApiError(req, err, {
+        route: 'openai.responses',
+        request_id: id,
+        response_mode: config.responseMode,
+        requested_model: payload.requestedModel || null
+      });
       const failed = createResponsesObject({
         id,
         body,
@@ -3056,7 +3119,7 @@ async function route(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  route(req, res).catch(err => errorJson(res, err));
+  route(req, res).catch(err => errorJson(req, res, err));
 });
 
 export {
