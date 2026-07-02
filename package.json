@@ -10,7 +10,7 @@
     "test": "node test/response-rendering.test.mjs"
   },
   "dependencies": {
-    "@synaptrix/spilli": "^0.4.5"
+    "@synaptrix/spilli": "^0.4.6"
   },
   "engines": {
     "node": ">=20"
