@@ -146,7 +146,7 @@ Copy `.env.example` into your process manager or shell environment.
 
 ## Dynamic Models
 
-`GET /v1/models` fetches the same host inventory used by the VS Code extension for the active model scope. It returns the friendly display name as the API model id and includes the underlying SpiLLI UID as `uid`.
+`GET /v1/models` uses the same public-model discovery approach as the VS Code extension for the active model scope. Public scope merges the backend public catalog with host inventory, while non-public scopes use host inventory. It returns the friendly display name as the API model id and includes the underlying SpiLLI UID as `uid`.
 
 The bridge starts with `public` model scope. Change it at runtime with:
 

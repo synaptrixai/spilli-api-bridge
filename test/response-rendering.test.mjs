@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 
 import {
   extractHarmonyFinalText,
+  mergePublicModels,
+  normalizePublicCatalogModels,
   parseToolCallsFromOutput,
   renderText,
   toResponsesOutputItems
@@ -96,5 +98,44 @@ for (const item of output) {
     'Responses output does not contain Harmony channel markers'
   );
 }
+
+const publicCatalogModels = normalizePublicCatalogModels(
+  {
+    models: [
+      'Named Public Model.public',
+      { name: 'gguf:sha256:abc123', display_name: 'Tiny Public Model', scope: 'public' },
+      { name: 'gguf:fastsha256:11f125', scope: 'public' }
+    ]
+  },
+  { scope: 'public' }
+);
+
+assert.deepEqual(
+  publicCatalogModels,
+  [
+    { uid: 'Named Public Model', displayName: 'Named Public Model' },
+    { uid: 'gguf:sha256:abc123', displayName: 'Tiny Public Model' },
+    { uid: 'gguf:fastsha256:11f125', displayName: 'gguf:fastsha256:11f125' }
+  ],
+  'normalizes backend public model catalog entries'
+);
+
+const mergedPublicModels = mergePublicModels(
+  [
+    { uid: 'gguf:sha256:abc123', displayName: 'tinygemma3-Q8_0.gguf', count: 1 },
+    { uid: 'Host Public Model', displayName: 'Host Public Model', count: 2 }
+  ],
+  publicCatalogModels
+);
+
+assert.deepEqual(
+  mergedPublicModels,
+  [
+    { uid: 'gguf:sha256:abc123', displayName: 'tinygemma3-Q8_0.gguf', count: 1 },
+    { uid: 'Host Public Model', displayName: 'Host Public Model', count: 2 },
+    { uid: 'Named Public Model', displayName: 'Named Public Model', count: 0 }
+  ],
+  'merges backend public catalog models with host inventory and drops unlabeled hashed catalog-only models'
+);
 
 console.log('response rendering tests passed');

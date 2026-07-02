@@ -18,6 +18,7 @@ const DEFAULT_SPILLI_KEY_PATH = '~/.spilli';
 const DEFAULT_REQUEST_LOG_PATH = path.join(os.homedir(), '.spilli', 'spilli-api-bridge-requests.jsonl');
 const MAX_LOG_STRING_LENGTH = 20_000;
 const SPILLI_BACKEND_API_URL = 'https://sig.synaptrix.org';
+const SPILLI_AVAILABLE_MODELS_PATH = '/api/getavailablemodels';
 const SPILLI_HOST_NODES_PATH = '/api/getuserhosts';
 const SPILLI_HOST_NODE_DETAILS_PATH = '/api/gethostinfo';
 const SPILLI_TIER_PEM_FILENAMES = [
@@ -643,6 +644,200 @@ function normalizeModelLookupName(value) {
   return value.trim().toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ');
 }
 
+function parseScopedCatalogModelName(value) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return { name: '' };
+  }
+  const match = trimmed.match(/^(?<name>.+)\.(?<visibility>public|private|team|enterprise)(?:\.(?<teamName>.+))?$/);
+  if (!match?.groups) {
+    return { name: trimmed };
+  }
+  const name = match.groups.name?.trim();
+  const visibility = match.groups.visibility?.trim();
+  const teamName = match.groups.teamName?.trim();
+  if (!name || !visibility) {
+    return { name: trimmed };
+  }
+  return {
+    name,
+    visibility:
+      visibility === 'team' && teamName === '*'
+        ? 'enterprise'
+        : visibility === 'team' && teamName
+          ? `team.${teamName}`
+          : visibility,
+    teamName: teamName === '*' ? undefined : teamName
+  };
+}
+
+function catalogModelMatchesScope(visibility, teamName, requestedScope, requestedTeam) {
+  const requestedBaseScope = getBaseScope(requestedScope);
+  if (!requestedBaseScope) {
+    return true;
+  }
+  const modelBaseScope = getBaseScope(visibility);
+  if (!modelBaseScope) {
+    return true;
+  }
+  if (modelBaseScope !== requestedBaseScope) {
+    return false;
+  }
+  if (requestedBaseScope !== 'team') {
+    return true;
+  }
+  const targetTeam = normalizeTeamName(getTeamNameFromScope(requestedScope) ?? requestedTeam);
+  if (!targetTeam) {
+    return true;
+  }
+  const modelTeam = normalizeTeamName(getTeamNameFromScope(visibility) ?? teamName);
+  return !modelTeam || modelTeam === targetTeam;
+}
+
+function normalizePublicCatalogModels(response, config) {
+  const raw = Array.isArray(response?.models)
+    ? response.models
+    : Array.isArray(response?.data)
+      ? response.data
+      : [];
+  const models = [];
+  const dedupe = new Set();
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      const parsed = parseScopedCatalogModelName(item);
+      if (!parsed.name || dedupe.has(parsed.name)) {
+        continue;
+      }
+      if (!catalogModelMatchesScope(parsed.visibility, parsed.teamName, config.scope, config.team)) {
+        continue;
+      }
+      dedupe.add(parsed.name);
+      models.push({
+        uid: parsed.name,
+        displayName: parsed.name
+      });
+      continue;
+    }
+    if (!isRecord(item)) {
+      continue;
+    }
+    const rawName = readString(item.model) ?? readString(item.name) ?? readString(item.id);
+    if (!rawName) {
+      continue;
+    }
+    const parsed = parseScopedCatalogModelName(rawName);
+    if (!parsed.name || dedupe.has(parsed.name)) {
+      continue;
+    }
+    const visibility =
+      readString(item.visibility) ??
+      readString(item.visibility_scope) ??
+      readString(item.visibilityScope) ??
+      readString(item.scope) ??
+      parsed.visibility;
+    const teamName = readString(item.team_name) ?? readString(item.teamName) ?? parsed.teamName;
+    if (!catalogModelMatchesScope(visibility, teamName, config.scope, config.team)) {
+      continue;
+    }
+    const displayName =
+      readString(item.display_name) ??
+      readString(item.displayName) ??
+      readString(item.label) ??
+      readString(item.friendly_name) ??
+      readString(item.friendlyName);
+    dedupe.add(parsed.name);
+    models.push({
+      uid: parsed.name,
+      displayName: displayName && displayName !== parsed.name ? displayName : parsed.name
+    });
+  }
+  return models;
+}
+
+function isHashedModelUid(uid) {
+  return /^gguf:(?:sha256|fastsha256|fasthash256):/i.test(uid);
+}
+
+function finalizeModelCatalog(config, models) {
+  const sortedModels = [...models].sort((a, b) =>
+    a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' })
+  );
+  const displayNameCounts = new Map();
+  for (const model of sortedModels) {
+    displayNameCounts.set(model.displayName, (displayNameCounts.get(model.displayName) ?? 0) + 1);
+  }
+  for (const model of sortedModels) {
+    model.apiName =
+      (displayNameCounts.get(model.displayName) ?? 0) > 1
+        ? `${model.displayName} [${model.uid}]`
+        : model.displayName;
+  }
+  return {
+    scope: config.scope,
+    team: config.team,
+    models: sortedModels,
+    fetchedAt: new Date().toISOString()
+  };
+}
+
+async function fetchHostInventoryModels(config, pemContent) {
+  const nodesUrl = buildApiUrl(SPILLI_BACKEND_API_URL, SPILLI_HOST_NODES_PATH).toString();
+  const nodesResponse = await requestJsonWithPem(nodesUrl, {}, pemContent);
+  const nodeIds = extractHostNodes(nodesResponse);
+  const detailsUrl = buildApiUrl(SPILLI_BACKEND_API_URL, SPILLI_HOST_NODE_DETAILS_PATH).toString();
+  const details = await Promise.all(
+    nodeIds.map(async nodeId => extractHostNodeDetails(nodeId, await requestJsonWithPem(detailsUrl, { hostname: nodeId }, pemContent)))
+  );
+  const byUid = new Map();
+  for (const detail of details) {
+    const seenOnNode = new Set();
+    for (const model of detail.models) {
+      if (!hostModelMatchesScope(model, config.scope, config.team)) {
+        continue;
+      }
+      const uid = normalizeHostInventoryModelName(model);
+      if (!uid) {
+        continue;
+      }
+      seenOnNode.add(uid);
+      const displayName = normalizeHostInventoryDisplayName(model);
+      const existing = byUid.get(uid) ?? {
+        uid,
+        displayName: displayName || uid,
+        count: 0
+      };
+      if (displayName && existing.displayName === uid) {
+        existing.displayName = displayName;
+      }
+      byUid.set(uid, existing);
+    }
+    for (const uid of seenOnNode) {
+      const existing = byUid.get(uid);
+      if (existing) {
+        existing.count += 1;
+      }
+    }
+  }
+  return [...byUid.values()];
+}
+
+function mergePublicModels(hostModels, catalogModels) {
+  const byUid = new Map(hostModels.map(model => [model.uid, { ...model }]));
+  for (const model of catalogModels) {
+    const existing = byUid.get(model.uid);
+    const displayName = existing?.displayName || model.displayName || model.uid;
+    if (isHashedModelUid(model.uid) && !displayName) {
+      continue;
+    }
+    byUid.set(model.uid, {
+      uid: model.uid,
+      displayName,
+      count: existing?.count ?? 0
+    });
+  }
+  return [...byUid.values()].filter(model => !isHashedModelUid(model.uid) || model.displayName !== model.uid || model.count > 0);
+}
+
 async function fetchAvailableModels(config, { forceRefresh = false } = {}) {
   const cacheKey = catalogCacheKey(config);
   const now = Date.now();
@@ -659,62 +854,15 @@ async function fetchAvailableModels(config, { forceRefresh = false } = {}) {
   }
   state.pendingModelFetch = (async () => {
     const { pemContent } = readPemContent(config);
-    const nodesUrl = buildApiUrl(SPILLI_BACKEND_API_URL, SPILLI_HOST_NODES_PATH).toString();
-    const nodesResponse = await requestJsonWithPem(nodesUrl, {}, pemContent);
-    const nodeIds = extractHostNodes(nodesResponse);
-    const detailsUrl = buildApiUrl(SPILLI_BACKEND_API_URL, SPILLI_HOST_NODE_DETAILS_PATH).toString();
-    const details = await Promise.all(
-      nodeIds.map(async nodeId => extractHostNodeDetails(nodeId, await requestJsonWithPem(detailsUrl, { hostname: nodeId }, pemContent)))
-    );
-    const byUid = new Map();
-    for (const detail of details) {
-      const seenOnNode = new Set();
-      for (const model of detail.models) {
-        if (!hostModelMatchesScope(model, config.scope, config.team)) {
-          continue;
-        }
-        const uid = normalizeHostInventoryModelName(model);
-        if (!uid) {
-          continue;
-        }
-        seenOnNode.add(uid);
-        const displayName = normalizeHostInventoryDisplayName(model);
-        const existing = byUid.get(uid) ?? {
-          uid,
-          displayName: displayName || uid,
-          count: 0
-        };
-        if (displayName && existing.displayName === uid) {
-          existing.displayName = displayName;
-        }
-        byUid.set(uid, existing);
-      }
-      for (const uid of seenOnNode) {
-        const existing = byUid.get(uid);
-        if (existing) {
-          existing.count += 1;
-        }
-      }
+    const hostModels = await fetchHostInventoryModels(config, pemContent);
+    let models = hostModels;
+    if (getBaseScope(config.scope) === 'public') {
+      const modelsUrl = buildApiUrl(SPILLI_BACKEND_API_URL, SPILLI_AVAILABLE_MODELS_PATH).toString();
+      const response = await requestJsonWithPem(modelsUrl, { scope: 'public' }, pemContent);
+      const publicCatalogModels = normalizePublicCatalogModels(response, config);
+      models = mergePublicModels(hostModels, publicCatalogModels);
     }
-    const models = [...byUid.values()].sort((a, b) =>
-      a.displayName.localeCompare(b.displayName, undefined, { sensitivity: 'base' })
-    );
-    const displayNameCounts = new Map();
-    for (const model of models) {
-      displayNameCounts.set(model.displayName, (displayNameCounts.get(model.displayName) ?? 0) + 1);
-    }
-    for (const model of models) {
-      model.apiName =
-        (displayNameCounts.get(model.displayName) ?? 0) > 1
-          ? `${model.displayName} [${model.uid}]`
-          : model.displayName;
-    }
-    const catalog = {
-      scope: config.scope,
-      team: config.team,
-      models,
-      fetchedAt: new Date().toISOString()
-    };
+    const catalog = finalizeModelCatalog(config, models);
     state.modelCache = {
       cacheKey,
       expiresAt: Date.now() + config.modelCacheTtlMs,
@@ -3124,6 +3272,8 @@ const server = http.createServer((req, res) => {
 
 export {
   extractHarmonyFinalText,
+  mergePublicModels,
+  normalizePublicCatalogModels,
   parseToolCallsFromOutput,
   renderText,
   toResponsesOutputItems
