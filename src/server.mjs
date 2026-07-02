@@ -37,7 +37,7 @@ const state = {
   modelTeam: undefined,
   resourceRunQueues: new Map(),
   lastResolvedModelByScope: new Map(),
-  // Maps a previous_response_id to the SpilliSession that should be reused.
+  // Maps bridge-managed client session keys to live SpiLLI sessions.
   chatSessions: new Map()
 };
 
@@ -84,10 +84,6 @@ function getClaudeSessionKey(req) {
  */
 function getSpilliSessionKey(req) {
   return getCodexSessionKey(req) ?? getClaudeSessionKey(req);
-}
-
-function getResponseChainSessionKey(responseId) {
-  return getNamespacedSessionKey('response', responseId);
 }
 
 
@@ -2222,19 +2218,7 @@ async function handleOpenAiChatCompletions(req, res, config) {
     responseMode: config.responseMode
   });
   const created = Math.floor(Date.now() / 1000);
-  // Determine which session should be used based on chaining.
-  const previousResponseId = body.previous_response_id || undefined;
-  let chosenSession;
-  let resolvedModel;
-  const previousResponseKey = getResponseChainSessionKey(previousResponseId);
-  if (previousResponseKey && state.chatSessions.has(previousResponseKey)) {
-    chosenSession = state.chatSessions.get(previousResponseKey).session;
-  } else {
-    ({ chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config));
-  }
-  if (!resolvedModel) {
-    resolvedModel = await resolveRequestedModel(payload.requestedModel, config);
-  }
+  const { chosenSession, resolvedModel } = await getOrCreateClientSession(req, payload, config);
   if (body.stream === true) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -2280,7 +2264,6 @@ async function handleOpenAiChatCompletions(req, res, config) {
           })}\n\n`);
         }
       }, chosenSession, resolvedModel);
-      state.chatSessions.set(getResponseChainSessionKey(id), { session: result.session });
       const completion = toOpenAiChatCompletion({
         id,
         model: result.requestedModel,
@@ -2362,7 +2345,6 @@ async function handleOpenAiChatCompletions(req, res, config) {
     return;
   }
   const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
-  state.chatSessions.set(getResponseChainSessionKey(id), { session: result.session });
   const completion = toOpenAiChatCompletion({
     id,
     model: result.requestedModel,
@@ -2664,7 +2646,6 @@ function createResponsesObject({
     output_text: outputText,
 
     parallel_tool_calls: body.parallel_tool_calls ?? true,
-    previous_response_id: body.previous_response_id ?? null,
     reasoning: body.reasoning ?? null,
     store: body.store ?? false,
     temperature: body.temperature ?? null,

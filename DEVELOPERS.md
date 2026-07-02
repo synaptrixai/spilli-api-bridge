@@ -8,7 +8,7 @@ The bridge has three separate responsibilities:
 
 1. Discover live SpiLLI host inventory and expose model display names through `/v1/models`.
 2. Resolve API model names back to SpiLLI model UIDs.
-3. Forward each inference request to a shared SpiLLI resource session with a self-contained prompt/query payload.
+3. Forward each inference request through an explicitly tracked SpiLLI session with a self-contained prompt/query payload.
 
 Keep those concepts separate. Model inventory and resource allocation are not chat memory.
 
@@ -53,19 +53,32 @@ Inference may receive either the friendly API name or the UID. The bridge should
 
 ## SpiLLI SDK Session Semantics
 
-Treat `SpilliSession` as an acquired network resource for a model/scope/team, not as a chat conversation. The bridge should reuse it for the same resource so multiple chat sessions do not create duplicate network connections.
+Treat `SpilliSession` as an acquired network resource, not as chat memory. In this bridge, a live SpiLLI session must always be associated with a bridge-managed session key before inference runs.
 
 Do:
 
-- Use `service.getOrCreateSession({ model: uid, scope, team }, timeoutMs)` for normal inference.
+- Resolve a bridge session key from client metadata when present.
+  - Codex: `x-codex-turn-metadata` with `window_id`, `session_id`, and `thread_id`.
+  - Claude Code: `x-claude-code-session-id`.
+- Create or reuse sessions only through the bridge's tracked session maps before calling inference.
+- Call `runInference(...)` only with an explicit live `session` argument and the matching resolved model.
 - Send a complete prompt/query object on each `session.run({ prompt, query }, ...)` call.
 - Keep API/chat history outside the SpiLLI resource session and include it in prompt/query when needed.
-- Serialize `session.run()` calls per shared resource session to avoid overlapping native stream callbacks for the same model connection.
+- Serialize `session.run()` calls per live resource session to avoid overlapping native stream callbacks.
 
 Do not:
 
-- Use one SDK resource session as the source of chat memory.
+- Do not let `runInference(...)` create a fresh SpiLLI session internally.
+- Do not use `service.getOrCreateSession({ model, scope, team }, ...)` as a resource-wide fallback for ordinary chat traffic.
+- Do not share one SpiLLI session across different Claude/Codex chat sessions just because they target the same model.
+- Do not use one SDK resource session as the source of chat memory.
 - Use `clientId` in `session.run()` for chat ids or request ids. It is reserved for SDK/internal behavior.
+
+Why this matters:
+
+- Resource-wide SDK session reuse caused cross-chat context leakage between separate Claude Code sessions.
+- Untracked `service.request(...)` calls from inside inference create orphan sessions that the bridge cannot map back to the correct chat/session key.
+- The correct workflow is: derive bridge session key -> get or create tracked session -> pass that session into `runInference(...)` -> keep chat history in the HTTP payload.
 
 ## Anthropic/OpenAI Compatibility
 
