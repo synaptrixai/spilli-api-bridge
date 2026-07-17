@@ -176,6 +176,19 @@ Inference requests may pass either the friendly model id returned from `/v1/mode
 
 Anthropic-compatible `/v1/messages`, OpenAI-compatible `/v1/chat/completions`, and OpenAI-compatible `/v1/responses` support `stream: true`. In `raw` mode, streaming forwards SpiLLI SDK chunks as SSE text deltas and treats `[EOG]` as the end-of-generation marker instead of returning it to clients. In `compat` mode, the bridge keeps the parser-based tool-call conversion behavior for clients that require native tool-call blocks.
 
+## Chat Sessions
+
+The bridge maps client conversation metadata to SpiLLIHost's versioned `spilli_context` protocol:
+
+- Codex uses `window_id`, `session_id`, and `thread_id` from `x-codex-turn-metadata`.
+- Claude Code uses `x-claude-code-session-id`.
+- Other clients may send `x-spilli-session-id` to opt into stateful reuse.
+- Requests without a supported session identifier are isolated and hydrated as one-off conversations.
+
+The first turn, rewritten history, model changes, and reconnects use `hydrate`. Strict append-only follow-ups use `delta` and send only the uncommitted suffix as the current query. If SpiLLIHost reports `SPILLI_CONTEXT_MISS`, the bridge suppresses that internal marker and retries the same revision once with hydration.
+
+SDK chunks are incremental text deltas. The bridge converts each chunk once into the selected Anthropic or OpenAI SSE event format, then commits the revision and assistant history only after the SpiLLI run succeeds.
+
 The bridge logs inbound inference requests and converted SpiLLI prompt/query payloads as JSONL at `~/.spilli/spilli-api-bridge-requests.jsonl`. Override with `SPILLI_BRIDGE_REQUEST_LOG_PATH` when needed. Auth tokens are not logged, and very large strings are truncated.
 
 ## Smoke Test

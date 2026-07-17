@@ -48,6 +48,11 @@ function getNamespacedSessionKey(prefix, key) {
   return normalized ? `${prefix}:${normalized}` : undefined;
 }
 
+function stableBridgeId(prefix, value) {
+  const digest = crypto.createHash('sha256').update(String(value ?? '')).digest('hex').slice(0, 24);
+  return `${prefix}-${digest}`;
+}
+
 function getCodexSessionKey(req) {
   const metaHeader = req.headers['x-codex-turn-metadata'];
   if (!metaHeader) {
@@ -68,11 +73,36 @@ function getCodexSessionKey(req) {
     return undefined;
   }
 
-  return getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
+  const key = getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
+  return key
+    ? { key, windowId, sessionId, contextId: threadId }
+    : undefined;
 }
 
 function getClaudeSessionKey(req) {
-  return getNamespacedSessionKey('claude', asString(req.headers['x-claude-code-session-id']));
+  const externalId = asString(req.headers['x-claude-code-session-id']).trim();
+  const key = getNamespacedSessionKey('claude', externalId);
+  return key
+    ? {
+        key,
+        windowId: 'claude-code',
+        sessionId: externalId,
+        contextId: stableBridgeId('claude-context', externalId)
+      }
+    : undefined;
+}
+
+function getExplicitSessionKey(req) {
+  const externalId = asString(req.headers['x-spilli-session-id']).trim();
+  const key = getNamespacedSessionKey('spilli', externalId);
+  return key
+    ? {
+        key,
+        windowId: 'api-bridge',
+        sessionId: externalId,
+        contextId: stableBridgeId('api-context', externalId)
+      }
+    : undefined;
 }
 
 /**
@@ -82,10 +112,10 @@ function getClaudeSessionKey(req) {
  * `thread_id`. Claude Code provides `x-claude-code-session-id`.
  *
  * @param {import('node:http').IncomingMessage} req - HTTP request
- * @returns {string|undefined} Session key when present
+ * @returns {{key:string,windowId:string,sessionId:string,contextId:string}|undefined} Session identity when present
  */
-function getSpilliSessionKey(req) {
-  return getCodexSessionKey(req) ?? getClaudeSessionKey(req);
+function getSpilliSessionIdentity(req) {
+  return getCodexSessionKey(req) ?? getClaudeSessionKey(req) ?? getExplicitSessionKey(req);
 }
 
 
@@ -1551,8 +1581,14 @@ function messageText(role, content) {
 }
 
 function createHistoryItem(role, content) {
-  const text = messageText(role, content);
+  const normalizedRole = ['assistant', 'system'].includes(asString(role).trim().toLowerCase())
+    ? asString(role).trim().toLowerCase()
+    : 'user';
+  const normalizedContent = asString(content);
+  const text = messageText(normalizedRole, normalizedContent);
   return {
+    role: normalizedRole,
+    content: normalizedContent,
     text,
     hash: hashHistoryValue(text)
   };
@@ -1694,6 +1730,32 @@ function createStreamChunkForwarder(onChunk) {
   };
 }
 
+function createMarkerFilteringForwarder(onChunk, marker) {
+  let pending = '';
+  let blocked = false;
+  return {
+    onChunk(chunk) {
+      if (!onChunk || blocked) return;
+      const combined = pending + String(chunk ?? '');
+      if (combined.includes(marker)) {
+        pending = '';
+        blocked = true;
+        return;
+      }
+      // Retain enough leading text to suppress the host's surrounding |<error>| envelope too.
+      const keep = Math.min(marker.length + 32, combined.length);
+      const ready = combined.slice(0, combined.length - keep);
+      pending = combined.slice(combined.length - keep);
+      if (ready) onChunk(ready);
+    },
+    flush() {
+      if (!onChunk || blocked || !pending) return;
+      onChunk(pending);
+      pending = '';
+    }
+  };
+}
+
 function resourceCacheKey(resource) {
   return `${resource.model}|${resource.scope ?? ''}|${resource.team ?? ''}`;
 }
@@ -1721,30 +1783,81 @@ function historyHashesHavePrefix(historyHashes, prefixHashes) {
   return true;
 }
 
-function createRunPayloadFromHistory(historyState, historyItems, includePrompt) {
+function historyItemToContextMessage(item) {
   return {
-    requestedModel: historyState.requestedModel,
-    prompt: includePrompt ? historyState.prompt : '',
-    query: historyItems.map(item => item.text).join('\n\n')
+    role: item.role,
+    content: item.content
   };
 }
 
-function prepareSessionRunPayload(historyState, previousEntry, resourceKey) {
+function createSpilliContext(identity, resourceKey, revision, transferMode, recentItems = []) {
+  return {
+    version: 1,
+    window_id: identity.windowId,
+    session_id: identity.sessionId,
+    context_id: identity.contextId,
+    context_revision: revision,
+    transfer_mode: transferMode,
+    resource_key: resourceKey,
+    allow_cross_job_context_reuse: true,
+    delta_messages: transferMode === 'delta' ? [] : undefined,
+    recent_messages: transferMode === 'hydrate'
+      ? recentItems.map(historyItemToContextMessage)
+      : undefined
+  };
+}
+
+function createRunPayloadFromHistory(historyState, queryItems, context, hydrateContext) {
+  return {
+    requestedModel: historyState.requestedModel,
+    prompt: historyState.prompt,
+    query: queryItems.map(item => item.text).join('\n\n'),
+    spilliContext: context,
+    hydrateContext
+  };
+}
+
+function prepareSessionRunPayload(historyState, previousEntry, resourceKey, identity = undefined) {
   const previousHashes = previousEntry?.historyHashes ?? [];
-  const canReuse =
+  const canUseDelta =
     previousEntry?.initialized === true &&
     previousEntry?.session?.isLive?.() &&
     previousEntry.promptHash === historyState.promptHash &&
     previousEntry.resourceKey === resourceKey &&
     historyState.allowDelta &&
+    historyState.historyHashes.length > previousHashes.length &&
     historyHashesHavePrefix(historyState.historyHashes, previousHashes);
-  const historyItems = canReuse
+  const contextIdentity = identity ?? previousEntry?.identity ?? {
+    windowId: 'api-bridge',
+    sessionId: 'untracked-session',
+    contextId: 'untracked-context'
+  };
+  const revision = Math.max(0, previousEntry?.revision ?? 0) + 1;
+  const queryItems = canUseDelta
     ? historyState.historyItems.slice(previousHashes.length)
-    : historyState.historyItems;
+    : historyState.historyItems.slice(-1);
+  const hydratedItems = historyState.historyItems.slice(0, Math.max(0, historyState.historyItems.length - queryItems.length));
+  const transferMode = canUseDelta ? 'delta' : 'hydrate';
+  const hydrateContext = createSpilliContext(
+    contextIdentity,
+    resourceKey,
+    revision,
+    'hydrate',
+    hydratedItems
+  );
   return {
-    reused: Boolean(canReuse),
-    reason: canReuse ? 'append' : previousEntry?.session?.isLive?.() ? 'replace' : 'new',
-    payload: createRunPayloadFromHistory(historyState, historyItems, !canReuse)
+    reused: Boolean(canUseDelta),
+    reason: canUseDelta ? 'append' : previousEntry?.session?.isLive?.() ? 'replace' : 'new',
+    revision,
+    transferMode,
+    payload: createRunPayloadFromHistory(
+      historyState,
+      queryItems,
+      transferMode === 'delta'
+        ? createSpilliContext(contextIdentity, resourceKey, revision, 'delta')
+        : hydrateContext,
+      hydrateContext
+    )
   };
 }
 
@@ -1756,14 +1869,21 @@ function assistantHistoryItemForOpenAiChat(message) {
   return createHistoryItem('assistant', normalizeOpenAiChatMessageContent(message));
 }
 
+function createResponsesHistoryItem(item) {
+  const text = responsesInputItemToText(item);
+  if (!text) return undefined;
+  const explicitRole = responsesInputItemRole(item);
+  const itemType = isRecord(item) ? asString(item.type) : '';
+  const role = explicitRole === 'assistant' || itemType === 'function_call' || itemType === 'custom_tool_call'
+    ? 'assistant'
+    : 'user';
+  const prefix = `${role.toUpperCase()}:\n`;
+  return createHistoryItem(role, text.startsWith(prefix) ? text.slice(prefix.length) : text);
+}
+
 function assistantHistoryItemsForResponses(output) {
   return Array.isArray(output)
-    ? output
-        .map(item => {
-          const text = responsesInputItemToText(item);
-          return text ? { text, hash: hashHistoryValue(text) } : undefined;
-        })
-        .filter(Boolean)
+    ? output.map(createResponsesHistoryItem).filter(Boolean)
     : [];
 }
 
@@ -1782,7 +1902,13 @@ async function withResourceRunQueue(resource, callback) {
 }
 
 // Run inference using an already created SpiLLI session.
-async function runInference({ requestedModel, prompt, query }, config, streamOptions = {}, session, resolvedModelOverride) {
+async function runInference(
+  { requestedModel, prompt, query, spilliContext, hydrateContext },
+  config,
+  streamOptions = {},
+  session,
+  resolvedModelOverride
+) {
   const resolvedModel = resolvedModelOverride ?? await resolveRequestedModel(requestedModel, config);
   const resource = buildResource(resolvedModel, config);
   const apiModelName = requestedModel || resolvedModel.displayName;
@@ -1792,14 +1918,32 @@ async function runInference({ requestedModel, prompt, query }, config, streamOpt
       throw Object.assign(new Error('SpiLLI model session is not live.'), { statusCode: 503 });
     }
     streamOptions.onStart?.({ requestedModel: apiModelName, resolvedModel });
-    const runOptions = { timeoutMs: config.requestTimeoutMs };
-    const streamForwarder =
-      typeof streamOptions.onChunk === 'function' ? createStreamChunkForwarder(streamOptions.onChunk) : undefined;
-    if (streamForwarder) {
-      runOptions.onChunk = chunk => streamForwarder.onChunk(chunk);
+    const runOnce = async (context, suppressContextMiss) => {
+      const runOptions = { timeoutMs: config.requestTimeoutMs };
+      const streamForwarder =
+        typeof streamOptions.onChunk === 'function' ? createStreamChunkForwarder(streamOptions.onChunk) : undefined;
+      const contextForwarder = suppressContextMiss && streamForwarder
+        ? createMarkerFilteringForwarder(chunk => streamForwarder.onChunk(chunk), 'SPILLI_CONTEXT_MISS')
+        : undefined;
+      if (streamForwarder) {
+        runOptions.onChunk = chunk => {
+          if (contextForwarder) contextForwarder.onChunk(chunk);
+          else streamForwarder.onChunk(chunk);
+        };
+      }
+      const raw = stripEogMarkers(await activeSession.run(
+        { prompt, query, spilli_context: context },
+        runOptions
+      ));
+      if (contextForwarder) contextForwarder.flush();
+      streamForwarder?.flush();
+      return raw;
+    };
+
+    let raw = await runOnce(spilliContext, spilliContext?.transfer_mode === 'delta');
+    if (spilliContext?.transfer_mode === 'delta' && raw.includes('SPILLI_CONTEXT_MISS')) {
+      raw = await runOnce(hydrateContext, false);
     }
-    const raw = stripEogMarkers(await activeSession.run({ prompt, query }, runOptions));
-    streamForwarder?.flush();
     return {
       raw,
       requestedModel: apiModelName,
@@ -1810,33 +1954,40 @@ async function runInference({ requestedModel, prompt, query }, config, streamOpt
 }
 
 async function getOrCreateClientSession(req, historyState, config) {
-  const sessionKey = getSpilliSessionKey(req);
+  const discoveredIdentity = getSpilliSessionIdentity(req);
+  const identity = discoveredIdentity ?? {
+    key: `ephemeral:${crypto.randomUUID()}`,
+    windowId: 'api-bridge',
+    sessionId: crypto.randomUUID(),
+    contextId: crypto.randomUUID()
+  };
+  const sessionKey = identity.key;
   const service = getService(config);
   const resolvedModel = await resolveRequestedModel(historyState.requestedModel, config);
   const resource = buildResource(resolvedModel, config);
   const resourceKey = resourceCacheKey(resource);
-  const previousEntry = sessionKey ? state.chatSessions.get(sessionKey) : undefined;
-  const prepared = prepareSessionRunPayload(historyState, previousEntry, resourceKey);
+  const previousEntry = discoveredIdentity ? state.chatSessions.get(sessionKey) : undefined;
+  const prepared = prepareSessionRunPayload(historyState, previousEntry, resourceKey, identity);
 
-  const chosenSession = prepared.reused
+  const canReuseTransport =
+    previousEntry?.session?.isLive?.() && previousEntry.resourceKey === resourceKey;
+  const chosenSession = canReuseTransport
     ? previousEntry.session
     : await service.request(resource, config.requestTimeoutMs);
-  if (sessionKey) {
-    if (prepared.reused) {
-      state.chatSessions.set(sessionKey, previousEntry);
-    } else {
-      state.chatSessions.set(sessionKey, {
-        session: chosenSession,
-        promptHash: historyState.promptHash,
-        historyHashes: [],
-        resourceKey,
-        initialized: false
-      });
-    }
+  if (discoveredIdentity) {
+    state.chatSessions.set(sessionKey, {
+      session: chosenSession,
+      identity,
+      promptHash: previousEntry?.promptHash ?? '',
+      historyHashes: previousEntry?.historyHashes ?? [],
+      resourceKey,
+      revision: previousEntry?.revision ?? 0,
+      initialized: canReuseTransport && previousEntry?.initialized === true
+    });
   }
 
   const commitHistory = (assistantItems = []) => {
-    if (!sessionKey) {
+    if (!discoveredIdentity) {
       return;
     }
     const current = state.chatSessions.get(sessionKey);
@@ -1846,6 +1997,8 @@ async function getOrCreateClientSession(req, historyState, config) {
     state.chatSessions.set(sessionKey, {
       ...current,
       initialized: true,
+      promptHash: historyState.promptHash,
+      revision: prepared.revision,
       historyHashes: [
         ...historyState.historyHashes,
         ...assistantItems.map(item => item.hash).filter(Boolean)
@@ -1858,6 +2011,7 @@ async function getOrCreateClientSession(req, historyState, config) {
     chosenSession,
     resolvedModel,
     payload: prepared.payload,
+    transferMode: prepared.transferMode,
     commitHistory
   };
 }
@@ -2885,10 +3039,7 @@ function buildHistoryStateForResponses(body) {
       ? [createHistoryItem('user', input)]
       : inputItems
           .filter((item) => !isInstructionItem(item))
-          .map((item) => {
-            const text = responsesInputItemToText(item);
-            return text ? { text, hash: hashHistoryValue(text) } : undefined;
-          })
+          .map(createResponsesHistoryItem)
           .filter(Boolean);
 
   return createHistoryState({
@@ -3447,6 +3598,7 @@ export {
   buildHistoryStateForAnthropic,
   buildHistoryStateForOpenAiChat,
   buildHistoryStateForResponses,
+  createMarkerFilteringForwarder,
   extractHarmonyFinalText,
   mergePublicModels,
   normalizePublicCatalogModels,

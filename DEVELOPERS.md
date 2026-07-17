@@ -53,35 +53,38 @@ Inference may receive either the friendly API name or the UID. The bridge should
 
 ## SpiLLI SDK Session Semantics
 
-Treat `SpilliSession` as an acquired network resource, not as chat memory. In this bridge, a live SpiLLI session must always be associated with a bridge-managed session key before inference runs.
+Treat `SpilliSession` as an acquired network resource, not as chat memory. The API request history is authoritative; `spilli_context` transfers that history into SpiLLIHost and identifies subsequent deltas.
 
 Do:
 
-- Resolve a bridge session key from client metadata when present.
-  - Codex: `x-codex-turn-metadata` with `window_id`, `session_id`, and `thread_id`.
-  - Claude Code: `x-claude-code-session-id`.
-- Create or reuse sessions only through the bridge's tracked session maps before calling inference.
-- Call `runInference(...)` only with an explicit live `session` argument and the matching resolved model.
-- Send full prompt/history only when creating or replacing a bridge-managed SpiLLI session.
-- For later append-only turns on the same bridge session key, send only the newly appended messages in `query` and leave `prompt` empty so the host-side session does not accumulate duplicate history.
-- Keep hashed history cursors in the bridge; do not keep a second full copy of chat history in memory.
-- Serialize `session.run()` calls per live resource session to avoid overlapping native stream callbacks.
+- Resolve stable identity from Codex `x-codex-turn-metadata`, Claude Code `x-claude-code-session-id`, or the generic `x-spilli-session-id` header.
+- Map Codex `thread_id` to `context_id`; derive a stable context id for clients that expose only one session id.
+- Keep a committed revision and transcript-hash cursor per client conversation.
+- Use `hydrate` for first use, reconnects, resource changes, and any history rewrite or compaction.
+- Put prior structured messages in `recent_messages` during hydration and keep the current input in `query`.
+- Use `delta` only for a strict append-only continuation, send only the new suffix in `query`, and include `delta_messages: []`.
+- Retry `SPILLI_CONTEXT_MISS` once at the same revision with a hydration snapshot.
+- Commit the revision and emitted assistant hashes only after inference succeeds.
+- Serialize native runs by resource to avoid overlapping callbacks on the shared SDK client.
 
 Do not:
 
-- Do not let `runInference(...)` create a fresh SpiLLI session internally.
-- Do not use `service.getOrCreateSession({ model, scope, team }, ...)` as a resource-wide fallback for ordinary chat traffic.
-- Do not share one SpiLLI session across different Claude/Codex chat sessions just because they target the same model.
-- Do not use one SDK resource session as the source of chat memory.
-- Use `clientId` in `session.run()` for chat ids or request ids. It is reserved for SDK/internal behavior.
+- Do not use the SDK session allocation id as the logical conversation id.
+- Do not send the full transcript in `query` on a delta turn.
+- Do not include the current query again in hydration `recent_messages`.
+- Do not advance revision state after errors, cancellation, or partial output.
+- Do not expose `SPILLI_CONTEXT_MISS` or `[EOG]` as an API text delta.
+- Do not use `clientId` for chat ids or tracing; it is reserved for SDK/native behavior.
 
 Why this matters:
 
-- Resource-wide SDK session reuse caused cross-chat context leakage between separate Claude Code sessions.
-- Untracked `service.request(...)` calls from inside inference create orphan sessions that the bridge cannot map back to the correct chat/session key.
-- Re-sending the full client history to an already stateful SpiLLI host session causes repeated accumulation of the same turns.
-- The correct workflow is: derive bridge session key -> resolve the normalized history cursor -> create/reuse a tracked session -> pass the full history or append-only delta into `runInference(...)` -> commit the emitted assistant response to the cursor.
-- If the incoming history is not an append-only continuation, for example after compaction or rewrite, create a fresh SpiLLI session and seed it with the full incoming history.
+- SpiLLIHost keys logical context by authenticated client plus `context_id`, and validates a delta against `context_revision - 1`.
+- The host keys model-specific cache state by authenticated client, `context_id`, and `resource_key`.
+- Hydration replaces the host snapshot at the requested base revision; a successful turn commits the requested revision.
+- Re-sending committed turns in `query` duplicates history, while omitting hydration after a lost host context produces a context miss.
+- A live transport can be reused for a rewritten conversation because hydration replaces context state; a disconnected transport can be replaced while retaining the same logical `context_id`.
+
+Requests with no supported session header receive an ephemeral identity and are not entered into the bridge reuse map. They hydrate independently on every request.
 
 ## Anthropic/OpenAI Compatibility
 
@@ -105,7 +108,7 @@ The bridge has two response modes:
 - `raw` is the default. It returns SpiLLI model text as assistant text and does not infer tool calls from model output.
 - `compat` preserves the parser-based behavior that translates Harmony/JSON tool-call text into API-native tool-call blocks.
 
-Streaming in `raw` mode forwards SpiLLI SDK chunks as text deltas after `[EOG]` handling. Streaming in `compat` mode may wait for final post-processing when tool-call conversion is needed.
+SDK `onChunk` values are deltas, not cumulative snapshots. Streaming in `raw` mode forwards each chunk once after internal marker filtering. Streaming in `compat` mode may wait for final post-processing when tool-call conversion is needed.
 
 ## Harmony Output
 

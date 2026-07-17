@@ -4,6 +4,7 @@ import {
   buildHistoryStateForAnthropic,
   buildHistoryStateForOpenAiChat,
   buildHistoryStateForResponses,
+  createMarkerFilteringForwarder,
   extractHarmonyFinalText,
   mergePublicModels,
   normalizePublicCatalogModels,
@@ -32,6 +33,25 @@ const patchTool = [
 ].join('');
 
 const partialFinal = '<|channel|>final<|message|>Clean final text without a terminator';
+
+const forwardedContextChunks = [];
+const contextMarkerForwarder = createMarkerFilteringForwarder(
+  chunk => forwardedContextChunks.push(chunk),
+  'SPILLI_CONTEXT_MISS'
+);
+contextMarkerForwarder.onChunk('|<error>|SPILLI_CONT');
+contextMarkerForwarder.onChunk('EXT_MISS|</error>|');
+contextMarkerForwarder.flush();
+assert.deepEqual(forwardedContextChunks, [], 'suppresses a fragmented context-miss marker');
+
+const forwardedTextChunks = [];
+const textMarkerForwarder = createMarkerFilteringForwarder(
+  chunk => forwardedTextChunks.push(chunk),
+  'SPILLI_CONTEXT_MISS'
+);
+textMarkerForwarder.onChunk('ordinary streamed text');
+textMarkerForwarder.flush();
+assert.equal(forwardedTextChunks.join(''), 'ordinary streamed text', 'preserves ordinary streamed deltas');
 
 assert.equal(
   extractHarmonyFinalText(toolThenFinal),
@@ -154,6 +174,9 @@ const firstPrepared = prepareSessionRunPayload(firstAnthropicHistory, undefined,
 assert.equal(firstPrepared.reused, false, 'first request creates a full-history run');
 assert.equal(firstPrepared.payload.prompt, firstAnthropicHistory.prompt);
 assert.equal(firstPrepared.payload.query, 'USER:\nHello');
+assert.equal(firstPrepared.payload.spilliContext.transfer_mode, 'hydrate');
+assert.equal(firstPrepared.payload.spilliContext.context_revision, 1);
+assert.deepEqual(firstPrepared.payload.spilliContext.recent_messages, []);
 
 const secondAnthropicHistory = buildHistoryStateForAnthropic({
   model: 'spilli-test',
@@ -169,16 +192,20 @@ const previousAfterAssistant = {
   promptHash: firstAnthropicHistory.promptHash,
   resourceKey,
   initialized: true,
+  revision: 1,
   historyHashes: secondAnthropicHistory.historyHashes.slice(0, 2)
 };
 const secondPrepared = prepareSessionRunPayload(secondAnthropicHistory, previousAfterAssistant, resourceKey);
 assert.equal(secondPrepared.reused, true, 'append-only request reuses the live session');
-assert.equal(secondPrepared.payload.prompt, '', 'append-only request does not resend the prompt');
+assert.equal(secondPrepared.payload.prompt, secondAnthropicHistory.prompt, 'append-only request retains system instructions');
 assert.equal(
   secondPrepared.payload.query,
   'USER:\nNext question',
   'append-only request sends only the new user suffix'
 );
+assert.equal(secondPrepared.payload.spilliContext.transfer_mode, 'delta');
+assert.equal(secondPrepared.payload.spilliContext.context_revision, 2);
+assert.deepEqual(secondPrepared.payload.spilliContext.delta_messages, []);
 
 const promptChangedHistory = buildHistoryStateForAnthropic({
   model: 'spilli-test',
@@ -192,7 +219,15 @@ const promptChangedHistory = buildHistoryStateForAnthropic({
 const promptChangedPrepared = prepareSessionRunPayload(promptChangedHistory, previousAfterAssistant, resourceKey);
 assert.equal(promptChangedPrepared.reused, false, 'prompt changes force a fresh full-history session');
 assert.equal(promptChangedPrepared.payload.prompt, promptChangedHistory.prompt);
-assert.equal(promptChangedPrepared.payload.query, promptChangedHistory.query);
+assert.equal(promptChangedPrepared.payload.query, 'USER:\nNext question');
+assert.deepEqual(
+  promptChangedPrepared.payload.spilliContext.recent_messages,
+  [
+    { role: 'user', content: 'Hello' },
+    { role: 'assistant', content: 'Hi there' }
+  ],
+  'hydration sends prior structured turns separately from the current query'
+);
 
 const compactedHistory = buildHistoryStateForAnthropic({
   model: 'spilli-test',
@@ -204,7 +239,11 @@ const compactedHistory = buildHistoryStateForAnthropic({
 });
 const compactedPrepared = prepareSessionRunPayload(compactedHistory, previousAfterAssistant, resourceKey);
 assert.equal(compactedPrepared.reused, false, 'rewritten or compacted history forces a fresh session');
-assert.equal(compactedPrepared.payload.query, compactedHistory.query);
+assert.equal(compactedPrepared.payload.query, 'USER:\nContinue from there');
+assert.deepEqual(
+  compactedPrepared.payload.spilliContext.recent_messages,
+  [{ role: 'user', content: 'Summary of the previous chat' }]
+);
 
 const openAiChatHistory = buildHistoryStateForOpenAiChat({
   model: 'spilli-test',
@@ -248,5 +287,21 @@ const responsesStringPrepared = prepareSessionRunPayload(
 assert.equal(responsesStringHistory.allowDelta, false, 'Responses string input disables history diffing');
 assert.equal(responsesStringPrepared.reused, false, 'Responses string input starts a fresh full-history session');
 assert.equal(responsesStringPrepared.payload.query, 'USER:\nOpaque single input');
+
+const responsesToolHistory = buildHistoryStateForResponses({
+  model: 'spilli-test',
+  input: [
+    { type: 'function_call', call_id: 'call_1', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+    { type: 'function_call_output', call_id: 'call_1', output: '/workspace' },
+    { role: 'user', content: [{ type: 'input_text', text: 'Continue' }] }
+  ]
+});
+const responsesToolPrepared = prepareSessionRunPayload(responsesToolHistory, undefined, resourceKey);
+assert.deepEqual(
+  responsesToolPrepared.payload.spilliContext.recent_messages.map(message => message.role),
+  ['assistant', 'user'],
+  'Responses tool calls and tool results preserve their roles during hydration'
+);
+assert.equal(responsesToolPrepared.payload.query, 'USER:\nContinue');
 
 console.log('response rendering tests passed');
