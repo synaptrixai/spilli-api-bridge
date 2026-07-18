@@ -4,12 +4,15 @@ import {
   buildHistoryStateForAnthropic,
   buildHistoryStateForOpenAiChat,
   buildHistoryStateForResponses,
+  buildResource,
   createMarkerFilteringForwarder,
   extractHarmonyFinalText,
+  extractSpilliHostError,
   mergePublicModels,
   normalizePublicCatalogModels,
   prepareSessionRunPayload,
   parseToolCallsFromOutput,
+  resourceCacheKey,
   renderText,
   toResponsesOutputItems
 } from '../src/server.mjs';
@@ -34,6 +37,12 @@ const patchTool = [
 
 const partialFinal = '<|channel|>final<|message|>Clean final text without a terminator';
 
+assert.equal(
+  extractSpilliHostError('|<error>|Pipeline error: decode failed|</error>|'),
+  'Pipeline error: decode failed',
+  'extracts SpiLLIHost error envelopes so they cannot be committed as assistant turns'
+);
+
 const forwardedContextChunks = [];
 const contextMarkerForwarder = createMarkerFilteringForwarder(
   chunk => forwardedContextChunks.push(chunk),
@@ -52,6 +61,33 @@ const textMarkerForwarder = createMarkerFilteringForwarder(
 textMarkerForwarder.onChunk('ordinary streamed text');
 textMarkerForwarder.flush();
 assert.equal(forwardedTextChunks.join(''), 'ordinary streamed text', 'preserves ordinary streamed deltas');
+
+const hostErrorChunks = [];
+const hostErrorForwarder = createMarkerFilteringForwarder(
+  chunk => hostErrorChunks.push(chunk),
+  '|<error>|'
+);
+hostErrorForwarder.onChunk('|<err');
+hostErrorForwarder.onChunk('or>|Pipeline error: decode failed|</error>|');
+hostErrorForwarder.flush();
+assert.deepEqual(hostErrorChunks, [], 'does not stream fragmented SpiLLIHost error envelopes as assistant text');
+
+const anthropicHistory = buildHistoryStateForAnthropic({
+  model: 'test-model',
+  system: 'System guidance',
+  tools: [{
+    name: 'Read',
+    description: 'Read a file from disk.',
+    input_schema: { type: 'object', properties: { file_path: { type: 'string' } } }
+  }],
+  messages: [{ role: 'user', content: 'Hello' }]
+});
+assert.match(anthropicHistory.prompt, /Read: Read a file from disk\./);
+assert.doesNotMatch(
+  anthropicHistory.prompt,
+  /file_path|Schema:/,
+  'Anthropic prompts keep compact tool guidance without duplicating full JSON schemas'
+);
 
 assert.equal(
   extractHarmonyFinalText(toolThenFinal),
@@ -127,7 +163,16 @@ const publicCatalogModels = normalizePublicCatalogModels(
   {
     models: [
       'Named Public Model.public',
-      { name: 'gguf:sha256:abc123', display_name: 'Tiny Public Model', scope: 'public' },
+      {
+        name: 'gguf:sha256:abc123',
+        display_name: 'Tiny Public Model',
+        scope: 'public',
+        graph_v2: {
+          compatibility_id: 'graph-abc',
+          total_layers: 80,
+          vertex_type: 'transformer'
+        }
+      },
       { name: 'gguf:fastsha256:11f125', scope: 'public' }
     ]
   },
@@ -138,7 +183,18 @@ assert.deepEqual(
   publicCatalogModels,
   [
     { uid: 'Named Public Model', displayName: 'Named Public Model' },
-    { uid: 'gguf:sha256:abc123', displayName: 'Tiny Public Model' },
+    {
+      uid: 'gguf:sha256:abc123',
+      displayName: 'Tiny Public Model',
+      allocationMetadata: {
+        allocationProtocol: 2,
+        graphV2: {
+          compatibilityId: 'graph-abc',
+          totalLayers: 80,
+          vertexType: 'transformer'
+        }
+      }
+    },
     { uid: 'gguf:fastsha256:11f125', displayName: 'gguf:fastsha256:11f125' }
   ],
   'normalizes backend public model catalog entries'
@@ -155,11 +211,59 @@ const mergedPublicModels = mergePublicModels(
 assert.deepEqual(
   mergedPublicModels,
   [
-    { uid: 'gguf:sha256:abc123', displayName: 'tinygemma3-Q8_0.gguf', count: 1 },
+    {
+      uid: 'gguf:sha256:abc123',
+      displayName: 'tinygemma3-Q8_0.gguf',
+      count: 1,
+      allocationMetadata: {
+        allocationProtocol: 2,
+        graphV2: {
+          compatibilityId: 'graph-abc',
+          totalLayers: 80,
+          vertexType: 'transformer'
+        }
+      }
+    },
     { uid: 'Host Public Model', displayName: 'Host Public Model', count: 2 },
     { uid: 'Named Public Model', displayName: 'Named Public Model', count: 0 }
   ],
   'merges backend public catalog models with host inventory and drops unlabeled hashed catalog-only models'
+);
+
+const v2Resource = buildResource(
+  {
+    uid: 'gguf:sha256:abc123',
+    allocationMetadata: {
+      allocationProtocol: 2,
+      graphV2: {
+        compatibilityId: 'graph-abc',
+        totalLayers: 80,
+        vertexType: 'transformer'
+      }
+    }
+  },
+  { scope: 'public' }
+);
+
+assert.deepEqual(
+  v2Resource,
+  {
+    model: 'gguf:sha256:abc123',
+    scope: 'public',
+    allocation_protocol: 2,
+    graph_v2: {
+      compatibility_id: 'graph-abc',
+      total_layers: 80,
+      vertex_type: 'transformer'
+    }
+  },
+  'builds a v2 SpiLLI resource when catalog metadata reports fragmented graph placement'
+);
+
+assert.notEqual(
+  resourceCacheKey({ model: 'same', scope: 'public' }),
+  resourceCacheKey(v2Resource),
+  'resource cache keys differ between plain full-model and v2 fragmented allocations'
 );
 
 const liveSession = { isLive: () => true };

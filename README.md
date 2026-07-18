@@ -174,6 +174,13 @@ curl "http://localhost:8888/v1/models?refresh=true"
 
 Inference requests may pass either the friendly model id returned from `/v1/models` or the raw UID. The bridge resolves the friendly name back to the UID before calling `SpilliService`.
 
+When the selected model carries SpiLLI allocation metadata, the bridge also forwards the same protocol details the VS Code extension uses:
+
+- Full-model allocations use the plain V1 resource shape.
+- Fragmented or graph-backed allocations use V2 metadata by setting `allocation_protocol: 2`.
+- If the catalog or host inventory includes `graph_v2` metadata such as `compatibility_id` and `total_layers`, the bridge forwards that as `resource.graph_v2` and treats the model as V2 even when `allocation_protocol` is omitted.
+- This protocol metadata is part of the bridge's resource identity, so a full-model session is not reused for a fragmented-graph session of the same model UID.
+
 Anthropic-compatible `/v1/messages`, OpenAI-compatible `/v1/chat/completions`, and OpenAI-compatible `/v1/responses` support `stream: true`. In `raw` mode, streaming forwards SpiLLI SDK chunks as SSE text deltas and treats `[EOG]` as the end-of-generation marker instead of returning it to clients. In `compat` mode, the bridge keeps the parser-based tool-call conversion behavior for clients that require native tool-call blocks.
 
 ## Chat Sessions
@@ -186,6 +193,12 @@ The bridge maps client conversation metadata to SpiLLIHost's versioned `spilli_c
 - Requests without a supported session identifier are isolated and hydrated as one-off conversations.
 
 The first turn, rewritten history, model changes, and reconnects use `hydrate`. Strict append-only follow-ups use `delta` and send only the uncommitted suffix as the current query. If SpiLLIHost reports `SPILLI_CONTEXT_MISS`, the bridge suppresses that internal marker and retries the same revision once with hydration.
+
+Model selection follows the extension's current allocation rule:
+
+- A host-advertised full model uses the default V1 resource request.
+- A host-advertised fragment set or public-catalog model with `graph_v2` metadata uses V2 allocation metadata on the SDK resource request.
+- If both host inventory and public catalog describe the same logical model, host metadata wins and catalog metadata fills gaps.
 
 SDK chunks are incremental text deltas. The bridge converts each chunk once into the selected Anthropic or OpenAI SSE event format, then commits the revision and assistant history only after the SpiLLI run succeeds.
 

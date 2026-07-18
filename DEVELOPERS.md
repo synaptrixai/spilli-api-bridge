@@ -80,9 +80,22 @@ Why this matters:
 
 - SpiLLIHost keys logical context by authenticated client plus `context_id`, and validates a delta against `context_revision - 1`.
 - The host keys model-specific cache state by authenticated client, `context_id`, and `resource_key`.
+- The bridge must treat allocation metadata as part of the effective model identity. A V1 full-model allocation and a V2 fragmented-graph allocation for the same UID are not interchangeable sessions.
 - Hydration replaces the host snapshot at the requested base revision; a successful turn commits the requested revision.
 - Re-sending committed turns in `query` duplicates history, while omitting hydration after a lost host context produces a context miss.
 - A live transport can be reused for a rewritten conversation because hydration replaces context state; a disconnected transport can be replaced while retaining the same logical `context_id`.
+
+## Allocation Protocol Selection
+
+Mirror the extension's current model-selection behavior:
+
+- Use the plain SDK resource request for full-model V1 allocations.
+- If a selected model advertises `allocation_protocol: 2`, forward that value.
+- If a selected model advertises `graph_v2` metadata with at least `compatibility_id` and `total_layers`, treat it as V2 even when `allocation_protocol` is missing.
+- Preserve `graph_v2` on the `SpilliResourceRequest` so fragmented allocations reach the correct host graph.
+- Include protocol metadata in any resource/session cache key so V1 and V2 sessions cannot be mixed.
+
+The bridge now extracts this metadata from both host inventory entries and public catalog entries, preferring host metadata when both exist for the same logical model and using catalog metadata to fill gaps.
 
 Requests with no supported session header receive an ephemeral identity and are not entered into the bridge reuse map. They hydrate independently on every request.
 

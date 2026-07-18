@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node src/server.mjs",
     "check": "node --check src/server.mjs",
-    "test": "node test/response-rendering.test.mjs"
+    "test": "node test/response-rendering.test.mjs",
+    "test:claude": "node test/claude-cli.e2e.mjs"
   },
   "dependencies": {
     "@synaptrix/spilli": "^0.4.6"

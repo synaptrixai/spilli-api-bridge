@@ -377,6 +377,48 @@ function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+function readInteger(value) {
+  return typeof value === 'number' && Number.isInteger(value) ? value : undefined;
+}
+
+function readObject(value) {
+  return isRecord(value) ? value : undefined;
+}
+
+function extractAllocationMetadata(candidate) {
+  if (!isRecord(candidate)) {
+    return undefined;
+  }
+  const directProtocol = readInteger(candidate.allocation_protocol) ?? readInteger(candidate.allocationProtocol);
+  const graph = readObject(candidate.graph_v2) ?? readObject(candidate.graphV2) ?? candidate;
+  const compatibilityId = readString(graph.compatibility_id) ?? readString(graph.compatibilityId);
+  const totalLayers = readInteger(graph.total_layers) ?? readInteger(graph.totalLayers);
+  if (directProtocol !== 2 && (!compatibilityId || typeof totalLayers !== 'number')) {
+    return undefined;
+  }
+  const metadata = {
+    allocationProtocol:
+      directProtocol === 1 || directProtocol === 2
+        ? directProtocol
+        : compatibilityId && typeof totalLayers === 'number'
+          ? 2
+          : undefined
+  };
+  if (compatibilityId && typeof totalLayers === 'number') {
+    metadata.graphV2 = {
+      compatibilityId,
+      totalLayers,
+      ...(readString(graph.vertex_type) ?? readString(graph.vertexType)
+        ? { vertexType: readString(graph.vertex_type) ?? readString(graph.vertexType) }
+        : {}),
+      ...(typeof (readInteger(graph.deadline_unix_ms) ?? readInteger(graph.deadlineUnixMs)) === 'number'
+        ? { deadlineUnixMs: readInteger(graph.deadline_unix_ms) ?? readInteger(graph.deadlineUnixMs) }
+        : {})
+    };
+  }
+  return metadata.allocationProtocol || metadata.graphV2 ? metadata : undefined;
+}
+
 function getBaseScope(scope) {
   const normalized = scope?.trim();
   if (!normalized) {
@@ -606,6 +648,7 @@ function extractHostNodeDetails(nodeId, response) {
           const resourceId = readString(item.resource_id) ?? readString(item.resourceId);
           const artifactHash = readString(item.artifact_hash) ?? readString(item.artifactHash);
           const uidModelName = /^gguf:sha256:/i.test(modelName) ? modelName : undefined;
+          const pipeline = readObject(item.pipeline) ?? readObject(readObject(item.metadata)?.pipeline);
           const rawDisplayName =
             readString(item.display_name) ??
             readString(item.displayName) ??
@@ -627,7 +670,17 @@ function extractHostNodeDetails(nodeId, response) {
                 readString(item.visibilityScope) ??
                 readString(item.scope)
             ),
-            teamName: readString(item.team_name) ?? readString(item.teamName)
+            teamName: readString(item.team_name) ?? readString(item.teamName),
+            logicalModelId: readString(pipeline?.logical_model_id) ?? readString(pipeline?.logicalModelId),
+            compatibilityId: readString(pipeline?.compatibility_id) ?? readString(pipeline?.compatibilityId),
+            fragmentStartLayer: readInteger(pipeline?.fragment_start_layer) ?? readInteger(pipeline?.fragmentStartLayer),
+            fragmentEndLayer: readInteger(pipeline?.fragment_end_layer) ?? readInteger(pipeline?.fragmentEndLayer),
+            totalLayers: readInteger(pipeline?.total_layers) ?? readInteger(pipeline?.totalLayers),
+            pipelineProtocolVersion: readInteger(pipeline?.protocol_version) ?? readInteger(pipeline?.protocolVersion),
+            allocationMetadata:
+              extractAllocationMetadata(item) ??
+              extractAllocationMetadata(pipeline) ??
+              extractAllocationMetadata(readObject(item.metadata)?.pipeline)
           };
         }
         if (!model?.modelName || dedupe.has(model.modelName)) {
@@ -656,7 +709,7 @@ function hostModelMatchesScope(model, requestedScope, requestedTeam) {
 }
 
 function normalizeHostInventoryModelName(model) {
-  const rawName = (model.resourceId || model.modelName || model.assetName || '').trim();
+  const rawName = (model.logicalModelId || model.resourceId || model.modelName || model.assetName || '').trim();
   return stripModelScopeSuffix(rawName);
 }
 
@@ -776,10 +829,15 @@ function normalizePublicCatalogModels(response, config) {
       readString(item.label) ??
       readString(item.friendly_name) ??
       readString(item.friendlyName);
+    const allocationMetadata =
+      extractAllocationMetadata(item) ??
+      extractAllocationMetadata(readObject(item.pipeline)) ??
+      extractAllocationMetadata(readObject(item.metadata)?.pipeline);
     dedupe.add(parsed.name);
     models.push({
       uid: parsed.name,
-      displayName: displayName && displayName !== parsed.name ? displayName : parsed.name
+      displayName: displayName && displayName !== parsed.name ? displayName : parsed.name,
+      ...(allocationMetadata ? { allocationMetadata } : {})
     });
   }
   return models;
@@ -840,6 +898,9 @@ async function fetchHostInventoryModels(config, pemContent) {
       if (displayName && existing.displayName === uid) {
         existing.displayName = displayName;
       }
+      if (!existing.allocationMetadata && model.allocationMetadata) {
+        existing.allocationMetadata = model.allocationMetadata;
+      }
       byUid.set(uid, existing);
     }
     for (const uid of seenOnNode) {
@@ -863,7 +924,10 @@ function mergePublicModels(hostModels, catalogModels) {
     byUid.set(model.uid, {
       uid: model.uid,
       displayName,
-      count: existing?.count ?? 0
+      count: existing?.count ?? 0,
+      ...((existing?.allocationMetadata ?? model.allocationMetadata)
+        ? { allocationMetadata: existing?.allocationMetadata ?? model.allocationMetadata }
+        : {})
     });
   }
   return [...byUid.values()].filter(model => !isHashedModelUid(model.uid) || model.displayName !== model.uid || model.count > 0);
@@ -891,7 +955,22 @@ async function fetchAvailableModels(config, { forceRefresh = false } = {}) {
       const modelsUrl = buildApiUrl(SPILLI_BACKEND_API_URL, SPILLI_AVAILABLE_MODELS_PATH).toString();
       const response = await requestJsonWithPem(modelsUrl, { scope: 'public' }, pemContent);
       const publicCatalogModels = normalizePublicCatalogModels(response, config);
-      models = mergePublicModels(hostModels, publicCatalogModels);
+      // Match the extension: the public signaling catalog already collapses
+      // physical fragments into a logical model list. Host inventory is only
+      // used as enrichment/availability proof, not as extra selectable entries.
+      const catalogModelsWithLabels = publicCatalogModels.filter(
+        model => !isHashedModelUid(model.uid) || model.displayName
+      );
+      models = catalogModelsWithLabels.map(model => ({
+        ...model,
+        count: hostModels.find(hostModel => hostModel.uid === model.uid)?.count ?? 0,
+        ...((hostModels.find(hostModel => hostModel.uid === model.uid)?.allocationMetadata ?? model.allocationMetadata)
+          ? {
+              allocationMetadata:
+                hostModels.find(hostModel => hostModel.uid === model.uid)?.allocationMetadata ?? model.allocationMetadata
+            }
+          : {})
+      }));
     }
     const catalog = finalizeModelCatalog(config, models);
     state.modelCache = {
@@ -1543,7 +1622,7 @@ const NO_TOOLS_PROMPT = [
   'Answer directly in final text and produce any requested artifact inline.'
 ].join(' ');
 
-function formatToolsForPrompt(tools) {
+function formatToolsForPrompt(tools, { includeSchemas = true } = {}) {
   if (!Array.isArray(tools) || tools.length === 0) {
     return NO_TOOLS_PROMPT;
   }
@@ -1565,6 +1644,11 @@ function formatToolsForPrompt(tools) {
       continue;
     }
     const description = asString(tool.description || tool.function?.description).trim();
+    if (!includeSchemas) {
+      const summary = description.replace(/\s+/g, ' ').slice(0, 240);
+      lines.push(`- ${name}: ${summary || 'No description'}`);
+      continue;
+    }
     const schema = tool.input_schema || tool.parameters || tool.function?.parameters || {};
     lines.push(`- ${name}: ${description || 'No description'} Schema: ${JSON.stringify(schema)}`);
   }
@@ -1623,7 +1707,13 @@ function normalizeOpenAiChatMessageContent(message) {
 }
 
 function buildHistoryStateForAnthropic(body) {
-  const prompt = [normalizeSystem(body.system), formatToolsForPrompt(body.tools)].filter(Boolean).join('\n\n');
+  // Claude Code already supplies extensive tool guidance in its system prompt.
+  // Keep names and short descriptions for the local model without duplicating
+  // every JSON schema into the model context.
+  const prompt = [
+    normalizeSystem(body.system),
+    formatToolsForPrompt(body.tools, { includeSchemas: false })
+  ].filter(Boolean).join('\n\n');
   const historyItems = Array.isArray(body.messages)
     ? body.messages
         .map(message => {
@@ -1687,6 +1777,22 @@ function buildHistoryStateForOpenAiChat(body) {
 
 function stripEogMarkers(value) {
   return String(value ?? '').replace(/\[EOG\]/g, '');
+}
+
+function extractSpilliHostError(value) {
+  const text = String(value ?? '');
+  const match = text.match(/\|<error>\|([\s\S]*?)\|<\/error>\|/);
+  return match ? match[1].trim() || 'SpiLLIHost returned an unspecified error.' : '';
+}
+
+function createSpilliHostRunError(raw) {
+  const message = extractSpilliHostError(raw);
+  if (!message) return undefined;
+  return Object.assign(new Error(message), {
+    statusCode: 502,
+    code: 'SPILLI_HOST_RUN_ERROR',
+    rawHostResponse: String(raw ?? '')
+  });
 }
 
 function createStreamChunkForwarder(onChunk) {
@@ -1757,13 +1863,42 @@ function createMarkerFilteringForwarder(onChunk, marker) {
 }
 
 function resourceCacheKey(resource) {
-  return `${resource.model}|${resource.scope ?? ''}|${resource.team ?? ''}`;
+  const graphKey = resource.graph_v2
+    ? [
+        resource.graph_v2.compatibility_id,
+        resource.graph_v2.total_layers,
+        resource.graph_v2.vertex_type ?? '',
+        resource.graph_v2.deadline_unix_ms ?? ''
+      ].join(':')
+    : '';
+  return [
+    resource.model,
+    resource.scope ?? '',
+    resource.team ?? '',
+    resource.allocation_protocol ?? '',
+    graphKey
+  ].join('|');
 }
 
 function buildResource(resolvedModel, config) {
   const resource = { model: resolvedModel.uid, scope: config.scope };
   if (config.team) {
     resource.team = config.team;
+  }
+  if (resolvedModel.allocationMetadata?.allocationProtocol) {
+    resource.allocation_protocol = resolvedModel.allocationMetadata.allocationProtocol;
+  }
+  if (resolvedModel.allocationMetadata?.graphV2) {
+    resource.graph_v2 = {
+      compatibility_id: resolvedModel.allocationMetadata.graphV2.compatibilityId,
+      total_layers: resolvedModel.allocationMetadata.graphV2.totalLayers,
+      ...(resolvedModel.allocationMetadata.graphV2.vertexType
+        ? { vertex_type: resolvedModel.allocationMetadata.graphV2.vertexType }
+        : {}),
+      ...(resolvedModel.allocationMetadata.graphV2.deadlineUnixMs
+        ? { deadline_unix_ms: resolvedModel.allocationMetadata.graphV2.deadlineUnixMs }
+        : {})
+    };
   }
   return resource;
 }
@@ -1817,6 +1952,66 @@ function createRunPayloadFromHistory(historyState, queryItems, context, hydrateC
   };
 }
 
+function summarizeHistoryState(historyState) {
+  return {
+    requestedModel: historyState?.requestedModel ?? null,
+    promptLength: historyState?.prompt?.length ?? 0,
+    promptHash: historyState?.promptHash ?? null,
+    historyItemCount: Array.isArray(historyState?.historyItems) ? historyState.historyItems.length : 0,
+    historyHashCount: Array.isArray(historyState?.historyHashes) ? historyState.historyHashes.length : 0,
+    allowDelta: historyState?.allowDelta === true,
+    queryLength: historyState?.query?.length ?? 0,
+    firstHistoryHash: Array.isArray(historyState?.historyHashes) && historyState.historyHashes.length > 0
+      ? historyState.historyHashes[0]
+      : null,
+    lastHistoryHash: Array.isArray(historyState?.historyHashes) && historyState.historyHashes.length > 0
+      ? historyState.historyHashes[historyState.historyHashes.length - 1]
+      : null
+  };
+}
+
+function summarizeSessionEntry(entry) {
+  if (!entry) {
+    return null;
+  }
+  return {
+    initialized: entry.initialized === true,
+    revision: Number.isInteger(entry.revision) ? entry.revision : null,
+    resourceKey: entry.resourceKey ?? null,
+    promptHash: entry.promptHash ?? null,
+    historyHashCount: Array.isArray(entry.historyHashes) ? entry.historyHashes.length : 0,
+    lastHistoryHash: Array.isArray(entry.historyHashes) && entry.historyHashes.length > 0
+      ? entry.historyHashes[entry.historyHashes.length - 1]
+      : null,
+    sessionLive: entry.session?.isLive?.() === true,
+    identity: entry.identity
+      ? {
+          key: entry.identity.key ?? null,
+          windowId: entry.identity.windowId ?? null,
+          sessionId: entry.identity.sessionId ?? null,
+          contextId: entry.identity.contextId ?? null
+        }
+      : null
+  };
+}
+
+function summarizeContextPayload(context) {
+  if (!context) {
+    return null;
+  }
+  return {
+    version: context.version ?? null,
+    windowId: context.window_id ?? null,
+    sessionId: context.session_id ?? null,
+    contextId: context.context_id ?? null,
+    contextRevision: context.context_revision ?? null,
+    transferMode: context.transfer_mode ?? null,
+    resourceKey: context.resource_key ?? null,
+    recentMessageCount: Array.isArray(context.recent_messages) ? context.recent_messages.length : 0,
+    deltaMessageCount: Array.isArray(context.delta_messages) ? context.delta_messages.length : 0
+  };
+}
+
 function prepareSessionRunPayload(historyState, previousEntry, resourceKey, identity = undefined) {
   const previousHashes = previousEntry?.historyHashes ?? [];
   const canUseDelta =
@@ -1859,6 +2054,14 @@ function prepareSessionRunPayload(historyState, previousEntry, resourceKey, iden
       hydrateContext
     )
   };
+}
+
+function shouldReuseTransport(previousEntry, prepared, resourceKey) {
+  return (
+    prepared.transferMode === 'delta' &&
+    previousEntry?.session?.isLive?.() &&
+    previousEntry.resourceKey === resourceKey
+  );
 }
 
 function assistantHistoryItemForAnthropic(message) {
@@ -1919,30 +2122,79 @@ async function runInference(
     }
     streamOptions.onStart?.({ requestedModel: apiModelName, resolvedModel });
     const runOnce = async (context, suppressContextMiss) => {
+      const attemptSummary = {
+        requestedModel: apiModelName,
+        resourceKey: resourceCacheKey(resource),
+        promptLength: prompt.length,
+        queryLength: query.length,
+        context: summarizeContextPayload(context),
+        hydrateContext: summarizeContextPayload(hydrateContext),
+        suppressContextMiss
+      };
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'spilli.run.start',
+        run: attemptSummary
+      }, 'RUN');
       const runOptions = { timeoutMs: config.requestTimeoutMs };
       const streamForwarder =
         typeof streamOptions.onChunk === 'function' ? createStreamChunkForwarder(streamOptions.onChunk) : undefined;
-      const contextForwarder = suppressContextMiss && streamForwarder
-        ? createMarkerFilteringForwarder(chunk => streamForwarder.onChunk(chunk), 'SPILLI_CONTEXT_MISS')
+      const hostOutputForwarder = streamForwarder
+        ? createMarkerFilteringForwarder(chunk => streamForwarder.onChunk(chunk), '|<error>|')
         : undefined;
       if (streamForwarder) {
         runOptions.onChunk = chunk => {
-          if (contextForwarder) contextForwarder.onChunk(chunk);
-          else streamForwarder.onChunk(chunk);
+          hostOutputForwarder.onChunk(chunk);
         };
       }
-      const raw = stripEogMarkers(await activeSession.run(
-        { prompt, query, spilli_context: context },
-        runOptions
-      ));
-      if (contextForwarder) contextForwarder.flush();
+      let raw;
+      try {
+        raw = stripEogMarkers(await activeSession.run(
+          { prompt, query, spilli_context: context },
+          runOptions
+        ));
+      } catch (error) {
+        await appendLog({
+          timestamp: new Date().toISOString(),
+          kind: 'spilli.run.error',
+          run: attemptSummary,
+          error: errorSummary(error)
+        }, 'RUN');
+        throw error;
+      }
+      hostOutputForwarder?.flush();
       streamForwarder?.flush();
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'spilli.run.complete',
+        run: {
+          ...attemptSummary,
+          rawLength: raw.length,
+          hasContextMiss: raw.includes('SPILLI_CONTEXT_MISS'),
+          rawPreview: raw.slice(0, 4000)
+        }
+      }, 'RUN');
       return raw;
     };
 
     let raw = await runOnce(spilliContext, spilliContext?.transfer_mode === 'delta');
     if (spilliContext?.transfer_mode === 'delta' && raw.includes('SPILLI_CONTEXT_MISS')) {
       raw = await runOnce(hydrateContext, false);
+    }
+    const hostError = createSpilliHostRunError(raw);
+    if (hostError) {
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'spilli.run.host_error',
+        run: {
+          requestedModel: apiModelName,
+          resourceKey: resourceCacheKey(resource),
+          transferMode: spilliContext?.transfer_mode ?? null,
+          error: hostError.message,
+          rawHostResponse: hostError.rawHostResponse
+        }
+      }, 'RUN');
+      throw hostError;
     }
     return {
       raw,
@@ -1969,8 +2221,7 @@ async function getOrCreateClientSession(req, historyState, config) {
   const previousEntry = discoveredIdentity ? state.chatSessions.get(sessionKey) : undefined;
   const prepared = prepareSessionRunPayload(historyState, previousEntry, resourceKey, identity);
 
-  const canReuseTransport =
-    previousEntry?.session?.isLive?.() && previousEntry.resourceKey === resourceKey;
+  const canReuseTransport = shouldReuseTransport(previousEntry, prepared, resourceKey);
   const chosenSession = canReuseTransport
     ? previousEntry.session
     : await service.request(resource, config.requestTimeoutMs);
@@ -2012,6 +2263,11 @@ async function getOrCreateClientSession(req, historyState, config) {
     resolvedModel,
     payload: prepared.payload,
     transferMode: prepared.transferMode,
+    reusedTransport: canReuseTransport,
+    revision: prepared.revision,
+    reason: prepared.reason,
+    previousEntry,
+    historyState,
     commitHistory
   };
 }
@@ -2109,6 +2365,7 @@ function getRequestLogPath() {
 
 function summarizeRequestForError(req) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+  const identity = getSpilliSessionIdentity(req);
   return {
     method: req.method,
     path: url.pathname,
@@ -2121,7 +2378,7 @@ function summarizeRequestForError(req) {
       'x-codex-turn-metadata': sanitizeForLog(req.headers['x-codex-turn-metadata']) ?? null,
       'x-openai-subagent': asString(req.headers['x-openai-subagent']) || null
     },
-    session_key: getSpilliSessionKey(req) ?? null
+    session_key: identity?.key ?? null
   };
 }
 
@@ -2319,6 +2576,26 @@ async function logInferenceRequest(kind, req, body, payload, extra = {}) {
   },'REQUEST');
 }
 
+async function logSessionProtocolDecision(kind, req, details) {
+  await appendLog({
+    timestamp: new Date().toISOString(),
+    kind,
+    method: req.method,
+    path: new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`).pathname,
+    protocol: details
+  }, 'PROTOCOL');
+}
+
+async function logSessionState(kind, req, details) {
+  await appendLog({
+    timestamp: new Date().toISOString(),
+    kind,
+    method: req.method,
+    path: new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`).pathname,
+    session: details
+  }, 'SESSION');
+}
+
 function harmonySummary(raw) {
   const parsed = parseHarmonyOutput(raw);
   if (!parsed.isHarmony) {
@@ -2466,17 +2743,55 @@ async function handleAnthropicMessages(req, res, config) {
   const historyState = buildHistoryStateForAnthropic(body);
   const fullPayload = anthropicToSpilliPayload(body);
   await logClaudeRequestShape(req, body, fullPayload);
-  const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
+  const {
+    chosenSession,
+    resolvedModel,
+    payload,
+    transferMode,
+    reusedTransport,
+    revision,
+    reason,
+    previousEntry,
+    historyState: preparedHistoryState,
+    commitHistory
+  } = await getOrCreateClientSession(req, historyState, config);
   const allowedToolNames = extractAvailableToolNames(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
   const rawMode = config.responseMode === 'raw';
   const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-  // await logInferenceRequest('anthropic.messages', req, body, payload, {
-  //   requestId: id,
-  //   allowedToolNames,
-  //   toolsEnabled,
-  //   responseMode: config.responseMode
-  // });
+  await logInferenceRequest('anthropic.messages', req, body, payload, {
+    requestId: id,
+    allowedToolNames,
+    toolsEnabled,
+    responseMode: config.responseMode,
+    transferMode,
+    reusedTransport,
+    revision,
+    reason
+  });
+  await logSessionProtocolDecision('anthropic.messages.protocol', req, {
+    requestId: id,
+    transferMode,
+    reusedTransport,
+    revision,
+    reason,
+    promptLength: payload.prompt.length,
+    queryLength: payload.query.length,
+    contextRevision: payload.spilliContext?.context_revision ?? null,
+    resourceKey: payload.spilliContext?.resource_key ?? null,
+    sessionKey: getSpilliSessionIdentity(req)?.key ?? null
+  });
+  await logSessionState('anthropic.messages.session.before', req, {
+    requestId: id,
+    transferMode,
+    reusedTransport,
+    revision,
+    reason,
+    previousEntry: summarizeSessionEntry(previousEntry),
+    nextHistoryState: summarizeHistoryState(preparedHistoryState),
+    spilliContext: summarizeContextPayload(payload.spilliContext),
+    hydrateContext: summarizeContextPayload(payload.hydrateContext)
+  });
   if (body.stream === true) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -2562,6 +2877,18 @@ async function handleAnthropicMessages(req, res, config) {
         ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
         : message;
       commitHistory([assistantHistoryItemForAnthropic(emittedMessage)]);
+      await logSessionState('anthropic.messages.session.after', req, {
+        requestId: id,
+        transferMode,
+        reusedTransport,
+        revision,
+        reason,
+        committedAssistantItems: 1,
+        emittedStopReason: emittedMessage.stop_reason ?? null,
+        emittedContentTypes: Array.isArray(emittedMessage.content)
+          ? emittedMessage.content.map(block => block?.type ?? null)
+          : []
+      });
       // await logInferenceResponse('anthropic.messages.response', {
       //   id,
       //   stream: true,
@@ -2615,7 +2942,15 @@ async function handleAnthropicMessages(req, res, config) {
         route: 'anthropic.messages',
         request_id: id,
         response_mode: config.responseMode,
-        requested_model: payload.requestedModel || null
+        requested_model: payload.requestedModel || null,
+        transfer_mode: transferMode,
+        reused_transport: reusedTransport,
+        revision,
+        reason,
+        previous_entry: summarizeSessionEntry(previousEntry),
+        history_state: summarizeHistoryState(preparedHistoryState),
+        spilli_context: summarizeContextPayload(payload.spilliContext),
+        hydrate_context: summarizeContextPayload(payload.hydrateContext)
       });
       writeSse(res, 'error', {
         type: 'error',
@@ -2644,6 +2979,19 @@ async function handleAnthropicMessages(req, res, config) {
     ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
     : message;
   commitHistory([assistantHistoryItemForAnthropic(emittedMessage)]);
+  await logSessionState('anthropic.messages.session.after', req, {
+    requestId: id,
+    transferMode,
+    reusedTransport,
+    revision,
+    reason,
+    committedAssistantItems: 1,
+    emittedStopReason: emittedMessage.stop_reason ?? null,
+    emittedContentTypes: Array.isArray(emittedMessage.content)
+      ? emittedMessage.content.map(block => block?.type ?? null)
+      : [],
+    retried
+  });
   // await logInferenceResponse('anthropic.messages.response', {
   //   id,
   //   stream: false,
@@ -3598,12 +3946,15 @@ export {
   buildHistoryStateForAnthropic,
   buildHistoryStateForOpenAiChat,
   buildHistoryStateForResponses,
+  buildResource,
   createMarkerFilteringForwarder,
   extractHarmonyFinalText,
+  extractSpilliHostError,
   mergePublicModels,
   normalizePublicCatalogModels,
   prepareSessionRunPayload,
   parseToolCallsFromOutput,
+  resourceCacheKey,
   renderText,
   toResponsesOutputItems
 };
