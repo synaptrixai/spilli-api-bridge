@@ -118,8 +118,8 @@ POST /v1/responses
 
 The bridge has two response modes:
 
-- `raw` is the default. It returns SpiLLI model text as assistant text and does not infer tool calls from model output.
-- `compat` preserves the parser-based behavior that translates Harmony/JSON tool-call text into API-native tool-call blocks.
+- `compat` is the default. It translates Harmony/JSON tool-call text into API-native tool-call blocks.
+- `raw` returns SpiLLI model text as assistant text and does not infer tool calls from model output.
 
 SDK `onChunk` values are deltas, not cumulative snapshots. Streaming in `raw` mode forwards each chunk once after internal marker filtering. Streaming in `compat` mode may wait for final post-processing when tool-call conversion is needed.
 

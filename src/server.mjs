@@ -13,8 +13,25 @@ import {
 } from '@synaptrix/spilli';
 
 const DEFAULT_PORT = 8888;
-const DEFAULT_TIMEOUT_MS = 600_000;
+const DEFAULT_ALLOCATION_TIMEOUT_MS = 60_000;
+const DEFAULT_RUN_TIMEOUT_MS = 300_000;
 const DEFAULT_MODEL_CACHE_TTL_MS = 30_000;
+const DEFAULT_WEB_SEARCH_TIMEOUT_MS = 10_000;
+const DEFAULT_WEB_SEARCH_MAX_RESULTS = 5;
+const DEFAULT_MAX_DURABLE_CONTEXTS_PER_RESOURCE = 2;
+const DEFAULT_MAX_TOOL_RESULT_CHARS = 8_000;
+const DEFAULT_TOOL_RESULT_RAW_CHARS = 4_000;
+const DEFAULT_TOOL_RESULT_COMPACT_CHARS = 16_000;
+const DEFAULT_TOOL_RESULT_COMPACT_TARGET_CHARS = 6_000;
+const DEFAULT_TOOL_RESULT_SUMMARY_TARGET_CHARS = 3_000;
+const DEFAULT_TOOL_RESULT_SUMMARIZER_TIMEOUT_MS = 60_000;
+const DEFAULT_ASK_CONTINUE_ON_MAX_TOKENS = true;
+const DEFAULT_CONTEXT_CHARS_PER_TOKEN = 3;
+const DEFAULT_CONTEXT_INPUT_BUDGET_FRACTION = 0.72;
+const DEFAULT_CONTEXT_OUTPUT_RESERVE_TOKENS = 1024;
+const DEFAULT_CONTEXT_MIN_HISTORY_CHARS = 512;
+const DEFAULT_CONTEXT_DEPENDENCY_RAW_CHARS = 24_000;
+const DEFAULT_TOOL_SCHEMA_PROMPT_MAX_CHARS = 24_000;
 const DEFAULT_SPILLI_KEY_PATH = '~/.spilli';
 const DEFAULT_REQUEST_LOG_PATH = path.join(os.homedir(), '.spilli', 'spilli-api-bridge-requests.jsonl');
 const MAX_LOG_STRING_LENGTH = 20_000;
@@ -38,19 +55,17 @@ const state = {
   modelScope: 'public',
   modelTeam: undefined,
   resourceRunQueues: new Map(),
+  // Maps SpiLLI resource keys to one live SDK transport/allocation. Logical
+  // chat histories are separated by spilli_context identities over this transport.
+  resourceSessions: new Map(),
   lastResolvedModelByScope: new Map(),
-  // Maps bridge-managed client session keys to live SpiLLI sessions.
+  // Maps bridge-managed client session keys to logical SpiLLI contexts.
   chatSessions: new Map()
 };
 
 function getNamespacedSessionKey(prefix, key) {
   const normalized = typeof key === 'string' ? key.trim() : '';
   return normalized ? `${prefix}:${normalized}` : undefined;
-}
-
-function stableBridgeId(prefix, value) {
-  const digest = crypto.createHash('sha256').update(String(value ?? '')).digest('hex').slice(0, 24);
-  return `${prefix}-${digest}`;
 }
 
 function getCodexSessionKey(req) {
@@ -73,36 +88,227 @@ function getCodexSessionKey(req) {
     return undefined;
   }
 
-  const key = getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
-  return key
-    ? { key, windowId, sessionId, contextId: threadId }
-    : undefined;
+  return getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
 }
 
 function getClaudeSessionKey(req) {
-  const externalId = asString(req.headers['x-claude-code-session-id']).trim();
-  const key = getNamespacedSessionKey('claude', externalId);
-  return key
-    ? {
-        key,
-        windowId: 'claude-code',
-        sessionId: externalId,
-        contextId: stableBridgeId('claude-context', externalId)
-      }
-    : undefined;
+  return getNamespacedSessionKey('claude', asString(req.headers['x-claude-code-session-id']));
 }
 
-function getExplicitSessionKey(req) {
-  const externalId = asString(req.headers['x-spilli-session-id']).trim();
-  const key = getNamespacedSessionKey('spilli', externalId);
-  return key
-    ? {
-        key,
-        windowId: 'api-bridge',
-        sessionId: externalId,
-        contextId: stableBridgeId('api-context', externalId)
-      }
-    : undefined;
+function stableBridgeId(prefix, value) {
+  const hash = crypto.createHash('sha256').update(String(value ?? '')).digest('hex').slice(0, 24);
+  return `${prefix}-${hash}`;
+}
+
+function getCodexSessionIdentity(req) {
+  const metaHeader = req.headers['x-codex-turn-metadata'];
+  if (!metaHeader) {
+    return undefined;
+  }
+
+  let meta;
+  try {
+    meta = typeof metaHeader === 'string' ? JSON.parse(metaHeader) : metaHeader;
+  } catch {
+    return undefined;
+  }
+
+  const windowId = asString(meta?.window_id).trim();
+  const sessionId = asString(meta?.session_id).trim();
+  const threadId = asString(meta?.thread_id).trim();
+  if (!windowId || !sessionId || !threadId) {
+    return undefined;
+  }
+
+  const key = getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
+  return {
+    key,
+    windowId,
+    sessionId: `${sessionId}:${threadId}`,
+    contextId: stableBridgeId('codex-context', `${windowId}:${sessionId}:${threadId}`)
+  };
+}
+
+function getClaudeSessionIdentity(req) {
+  const sessionId = asString(req.headers['x-claude-code-session-id']).trim();
+  if (!sessionId) {
+    return undefined;
+  }
+  return {
+    key: getNamespacedSessionKey('claude', sessionId),
+    windowId: 'claude-code',
+    sessionId,
+    contextId: stableBridgeId('claude-context', sessionId)
+  };
+}
+
+function getSpilliSessionIdentity(req) {
+  return getCodexSessionIdentity(req) ?? getClaudeSessionIdentity(req);
+}
+
+function anthropicSystemText(body) {
+  const system = body?.system;
+  if (typeof system === 'string') {
+    return system;
+  }
+  if (!Array.isArray(system)) {
+    return '';
+  }
+  return system
+    .map(part => (isRecord(part) ? asString(part.text) : asString(part)))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function shouldLogFullSystemPrompt() {
+  return readEnv('SPILLI_BRIDGE_LOG_SYSTEM_PROMPT', '0') === '1';
+}
+
+function shouldLogFullToolSchemas() {
+  return readEnv('SPILLI_BRIDGE_LOG_TOOL_SCHEMAS', '0') === '1';
+}
+
+function summarizeSystemPromptForLog(body, normalizedText) {
+  const text = typeof normalizedText === 'string'
+    ? normalizedText
+    : anthropicSystemText(body);
+  const summary = {
+    systemShape: summarizeAnthropicContentShape(body?.system),
+    systemPromptLength: text.length,
+    systemPromptHash: hashHistoryValue(text),
+    systemPromptPreview: text.slice(0, 4000)
+  };
+  if (shouldLogFullSystemPrompt()) {
+    summary.systemPromptText = text;
+  }
+  return summary;
+}
+
+function summarizeJsonSchemaForLog(schema) {
+  if (!isRecord(schema)) {
+    return {
+      type: typeof schema
+    };
+  }
+  const properties = isRecord(schema.properties) ? schema.properties : {};
+  return {
+    type: asString(schema.type) || undefined,
+    required: Array.isArray(schema.required) ? schema.required.map(item => asString(item)).filter(Boolean) : [],
+    propertyNames: Object.keys(properties).sort(),
+    properties: Object.fromEntries(
+      Object.entries(properties).map(([name, value]) => {
+        const property = isRecord(value) ? value : {};
+        return [
+          name,
+          {
+            type: asString(property.type) || undefined,
+            enum: Array.isArray(property.enum) ? property.enum.map(item => asString(item)).filter(Boolean) : undefined,
+            descriptionLength: asString(property.description).length,
+            descriptionPreview: asString(property.description).slice(0, 500)
+          }
+        ];
+      })
+    )
+  };
+}
+
+function summarizeToolSchemasForLog(tools) {
+  if (!Array.isArray(tools)) {
+    return {
+      toolCount: 0,
+      tools: []
+    };
+  }
+  const summaries = tools.map((tool, index) => {
+    if (!isRecord(tool)) {
+      return {
+        index,
+        type: typeof tool
+      };
+    }
+    const name = asString(tool.name || tool.function?.name).trim();
+    const description = asString(tool.description || tool.function?.description);
+    const inputSchema = tool.input_schema || tool.inputSchema || tool.function?.parameters || tool.function?.input_schema;
+    return {
+      index,
+      name,
+      keys: Object.keys(tool).sort(),
+      descriptionLength: description.length,
+      descriptionPreview: description.slice(0, 1000),
+      inputSchema: summarizeJsonSchemaForLog(inputSchema),
+      hasCacheControl: isRecord(tool.cache_control) || isRecord(tool.cacheControl),
+      type: asString(tool.type) || undefined
+    };
+  });
+  const summary = {
+    toolCount: summaries.length,
+    toolNames: summaries.map(tool => tool.name).filter(Boolean),
+    tools: summaries
+  };
+  if (shouldLogFullToolSchemas()) {
+    summary.toolSchemas = sanitizeForLog(tools);
+  }
+  return summary;
+}
+
+function getClientKind(req) {
+  if (getClaudeSessionIdentity(req)) {
+    return 'claude';
+  }
+  if (getCodexSessionIdentity(req)) {
+    return 'codex';
+  }
+  return 'unknown';
+}
+
+function isClaudeSubagentRequest(req, body = {}) {
+  if (!getClaudeSessionIdentity(req)) {
+    return false;
+  }
+  const headerText = Object.entries(req.headers)
+    .map(([name, value]) => `${name}: ${Array.isArray(value) ? value.join(' ') : value ?? ''}`)
+    .join('\n')
+    .toLowerCase();
+  const systemText = anthropicSystemText(body).toLowerCase();
+  return (
+    headerText.includes('cc_is_subagent=true') ||
+    systemText.includes('cc_is_subagent=true') ||
+    systemText.includes('you are an agent for claude code') ||
+    systemText.includes('claude code subagent')
+  );
+}
+
+function isClaudeUtilityRequest(req, body = {}) {
+  if (!getClaudeSessionIdentity(req)) {
+    return false;
+  }
+  const systemText = anthropicSystemText(body).toLowerCase();
+  return (
+    systemText.includes('generate a concise, sentence-case title') ||
+    systemText.includes('return json with a single "title" field')
+  );
+}
+
+function getLeaseKindForRequest(req, body = {}) {
+  return isClaudeSubagentRequest(req, body) || isClaudeUtilityRequest(req, body)
+    ? 'ephemeral'
+    : 'durable';
+}
+
+function specializeSessionIdentityForHistory(identity, historyState) {
+  if (!identity || !String(identity.key ?? '').startsWith('claude:')) {
+    return identity;
+  }
+  const promptHash = asString(historyState?.promptHash).trim();
+  if (!promptHash) {
+    return identity;
+  }
+  const promptScope = stableBridgeId('prompt', promptHash);
+  return {
+    ...identity,
+    key: `${identity.key}:${promptScope}`,
+    contextId: stableBridgeId('claude-context', `${identity.sessionId}:${promptHash}`)
+  };
 }
 
 /**
@@ -112,10 +318,10 @@ function getExplicitSessionKey(req) {
  * `thread_id`. Claude Code provides `x-claude-code-session-id`.
  *
  * @param {import('node:http').IncomingMessage} req - HTTP request
- * @returns {{key:string,windowId:string,sessionId:string,contextId:string}|undefined} Session identity when present
+ * @returns {string|undefined} Session key when present
  */
-function getSpilliSessionIdentity(req) {
-  return getCodexSessionKey(req) ?? getClaudeSessionKey(req) ?? getExplicitSessionKey(req);
+function getSpilliSessionKey(req) {
+  return getCodexSessionKey(req) ?? getClaudeSessionKey(req);
 }
 
 
@@ -169,6 +375,21 @@ function loadEnvFiles() {
 function readEnv(name, fallback = '') {
   const value = process.env[name];
   return typeof value === 'string' && value.trim() ? value.trim() : fallback;
+}
+
+function readPositiveIntEnv(name, fallback) {
+  const parsed = Number.parseInt(readEnv(name), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function readOptionalPositiveIntEnv(name) {
+  const parsed = Number.parseInt(readEnv(name), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function readPositiveFloatEnv(name, fallback) {
+  const parsed = Number.parseFloat(readEnv(name));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function expandHome(input) {
@@ -248,8 +469,65 @@ function parseModelAliases(value) {
 }
 
 function getConfig() {
-  const requestTimeoutMs = Number.parseInt(readEnv('SPILLI_BRIDGE_REQUEST_TIMEOUT_MS'), 10);
+  const allocationTimeoutMs = Number.parseInt(
+    readEnv('SPILLI_BRIDGE_ALLOCATION_TIMEOUT_MS', readEnv('SPILLI_BRIDGE_REQUEST_TIMEOUT_MS')),
+    10
+  );
+  const runTimeoutMs = Number.parseInt(
+    readEnv('SPILLI_BRIDGE_RUN_TIMEOUT_MS', readEnv('SPILLI_BRIDGE_INFERENCE_TIMEOUT_MS')),
+    10
+  );
   const modelCacheTtlMs = Number.parseInt(readEnv('SPILLI_BRIDGE_MODEL_CACHE_TTL_MS'), 10);
+  const webSearchTimeoutMs = Number.parseInt(readEnv('SPILLI_BRIDGE_WEB_SEARCH_TIMEOUT_MS'), 10);
+  const webSearchMaxResults = Number.parseInt(readEnv('SPILLI_BRIDGE_WEB_SEARCH_MAX_RESULTS'), 10);
+  const legacyMaxToolResultChars = Number.parseInt(readEnv('SPILLI_BRIDGE_MAX_TOOL_RESULT_CHARS'), 10);
+  const toolResultRawChars = readPositiveIntEnv('SPILLI_BRIDGE_TOOL_RESULT_RAW_CHARS', DEFAULT_TOOL_RESULT_RAW_CHARS);
+  const toolResultCompactChars = readPositiveIntEnv(
+    'SPILLI_BRIDGE_TOOL_RESULT_COMPACT_CHARS',
+    Number.isFinite(legacyMaxToolResultChars) && legacyMaxToolResultChars > 0
+      ? legacyMaxToolResultChars
+      : DEFAULT_TOOL_RESULT_COMPACT_CHARS
+  );
+  const toolResultCompactTargetChars = readPositiveIntEnv(
+    'SPILLI_BRIDGE_TOOL_RESULT_COMPACT_TARGET_CHARS',
+    DEFAULT_TOOL_RESULT_COMPACT_TARGET_CHARS
+  );
+  const toolResultSummaryTargetChars = readPositiveIntEnv(
+    'SPILLI_BRIDGE_TOOL_RESULT_SUMMARY_TARGET_CHARS',
+    DEFAULT_TOOL_RESULT_SUMMARY_TARGET_CHARS
+  );
+  const toolResultSummarizerTimeoutMs = readPositiveIntEnv(
+    'SPILLI_BRIDGE_TOOL_RESULT_SUMMARIZER_TIMEOUT_MS',
+    DEFAULT_TOOL_RESULT_SUMMARIZER_TIMEOUT_MS
+  );
+  const maxHistoryCharsOverride = readOptionalPositiveIntEnv('SPILLI_BRIDGE_MAX_HISTORY_CHARS');
+  const contextCharsPerToken = readPositiveFloatEnv(
+    'SPILLI_BRIDGE_CONTEXT_CHARS_PER_TOKEN',
+    DEFAULT_CONTEXT_CHARS_PER_TOKEN
+  );
+  const contextInputBudgetFraction = Math.min(
+    0.95,
+    Math.max(
+      0.1,
+      readPositiveFloatEnv('SPILLI_BRIDGE_CONTEXT_INPUT_BUDGET_FRACTION', DEFAULT_CONTEXT_INPUT_BUDGET_FRACTION)
+    )
+  );
+  const contextOutputReserveTokens = readPositiveIntEnv(
+    'SPILLI_BRIDGE_CONTEXT_OUTPUT_RESERVE_TOKENS',
+    DEFAULT_CONTEXT_OUTPUT_RESERVE_TOKENS
+  );
+  const contextDependencyRawChars = readPositiveIntEnv(
+    'SPILLI_BRIDGE_CONTEXT_DEPENDENCY_RAW_CHARS',
+    DEFAULT_CONTEXT_DEPENDENCY_RAW_CHARS
+  );
+  const toolSchemaPromptMaxChars = readPositiveIntEnv(
+    'SPILLI_BRIDGE_TOOL_SCHEMA_PROMPT_MAX_CHARS',
+    DEFAULT_TOOL_SCHEMA_PROMPT_MAX_CHARS
+  );
+  const maxDurableContextsPerResource = Number.parseInt(
+    readEnv('SPILLI_BRIDGE_MAX_DURABLE_CONTEXTS_PER_RESOURCE'),
+    10
+  );
   const scope = normalizeConfiguredScope(state.modelScope);
   return {
     host: readEnv('SPILLI_BRIDGE_HOST', '127.0.0.1'),
@@ -258,12 +536,52 @@ function getConfig() {
     scope,
     team: state.modelTeam ?? readEnv('SPILLI_BRIDGE_TEAM'),
     authToken: readEnv('SPILLI_BRIDGE_AUTH_TOKEN'),
-    requestTimeoutMs: Number.isFinite(requestTimeoutMs) && requestTimeoutMs > 0 ? requestTimeoutMs : DEFAULT_TIMEOUT_MS,
+    allocationTimeoutMs:
+      Number.isFinite(allocationTimeoutMs) && allocationTimeoutMs > 0
+        ? allocationTimeoutMs
+        : DEFAULT_ALLOCATION_TIMEOUT_MS,
+    runTimeoutMs: Number.isFinite(runTimeoutMs) && runTimeoutMs > 0 ? runTimeoutMs : DEFAULT_RUN_TIMEOUT_MS,
     modelCacheTtlMs:
       Number.isFinite(modelCacheTtlMs) && modelCacheTtlMs > 0 ? modelCacheTtlMs : DEFAULT_MODEL_CACHE_TTL_MS,
     nativeCacheDir: readEnv('SPILLI_BRIDGE_NATIVE_CACHE_DIR'),
     modelAliases: parseModelAliases(readEnv('SPILLI_BRIDGE_MODEL_ALIASES')),
-    responseMode: normalizeResponseMode(readEnv('SPILLI_BRIDGE_RESPONSE_MODE', 'raw'))
+    responseMode: normalizeResponseMode(readEnv('SPILLI_BRIDGE_RESPONSE_MODE', 'compat')),
+    askContinueOnMaxTokens:
+      readEnv('SPILLI_BRIDGE_ASK_CONTINUE_ON_MAX_TOKENS', DEFAULT_ASK_CONTINUE_ON_MAX_TOKENS ? '1' : '0') !== '0',
+    webSearchEndpoint: readEnv('SPILLI_BRIDGE_WEB_SEARCH_ENDPOINT'),
+    webSearchTimeoutMs:
+      Number.isFinite(webSearchTimeoutMs) && webSearchTimeoutMs > 0
+        ? webSearchTimeoutMs
+        : DEFAULT_WEB_SEARCH_TIMEOUT_MS,
+    webSearchMaxResults:
+      Number.isFinite(webSearchMaxResults) && webSearchMaxResults > 0
+        ? webSearchMaxResults
+        : DEFAULT_WEB_SEARCH_MAX_RESULTS,
+    maxToolResultChars:
+      Number.isFinite(legacyMaxToolResultChars) && legacyMaxToolResultChars > 0
+        ? legacyMaxToolResultChars
+        : DEFAULT_MAX_TOOL_RESULT_CHARS,
+    toolResultRawChars,
+    toolResultCompactChars: Math.max(toolResultRawChars, toolResultCompactChars),
+    toolResultCompactTargetChars,
+    toolResultSummaryTargetChars,
+    toolResultSummarizerEndpoint: readEnv('SPILLI_BRIDGE_TOOL_RESULT_SUMMARIZER_ENDPOINT'),
+    compactToolResults: readEnv('SPILLI_BRIDGE_COMPACT_TOOL_RESULTS', '0') === '1',
+    toolResultSummarizerEnabled: readEnv('SPILLI_BRIDGE_TOOL_RESULT_SUMMARIZER_ENABLED', '1') !== '0',
+    toolResultSummarizerModel: readEnv('SPILLI_BRIDGE_TOOL_RESULT_SUMMARIZER_MODEL'),
+    toolResultSummarizerTimeoutMs,
+    renderToolSchemas: readEnv('SPILLI_BRIDGE_RENDER_TOOL_SCHEMAS', '1') !== '0',
+    toolSchemaPromptMaxChars,
+    maxHistoryCharsOverride,
+    contextCharsPerToken,
+    contextInputBudgetFraction,
+    contextOutputReserveTokens,
+    contextDependencyRawChars,
+    releaseEphemeralContexts: readEnv('SPILLI_BRIDGE_RELEASE_EPHEMERAL_CONTEXTS', '1') !== '0',
+    maxDurableContextsPerResource:
+      Number.isFinite(maxDurableContextsPerResource) && maxDurableContextsPerResource > 0
+        ? maxDurableContextsPerResource
+        : DEFAULT_MAX_DURABLE_CONTEXTS_PER_RESOURCE
   };
 }
 
@@ -357,6 +675,15 @@ function requestJsonWithPem(url, payload, pemContent) {
   });
 }
 
+function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_WEB_SEARCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, {
+    ...options,
+    signal: controller.signal
+  }).finally(() => clearTimeout(timer));
+}
+
 function isRecord(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -375,48 +702,6 @@ function tryParseJson(value) {
 
 function readString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
-}
-
-function readInteger(value) {
-  return typeof value === 'number' && Number.isInteger(value) ? value : undefined;
-}
-
-function readObject(value) {
-  return isRecord(value) ? value : undefined;
-}
-
-function extractAllocationMetadata(candidate) {
-  if (!isRecord(candidate)) {
-    return undefined;
-  }
-  const directProtocol = readInteger(candidate.allocation_protocol) ?? readInteger(candidate.allocationProtocol);
-  const graph = readObject(candidate.graph_v2) ?? readObject(candidate.graphV2) ?? candidate;
-  const compatibilityId = readString(graph.compatibility_id) ?? readString(graph.compatibilityId);
-  const totalLayers = readInteger(graph.total_layers) ?? readInteger(graph.totalLayers);
-  if (directProtocol !== 2 && (!compatibilityId || typeof totalLayers !== 'number')) {
-    return undefined;
-  }
-  const metadata = {
-    allocationProtocol:
-      directProtocol === 1 || directProtocol === 2
-        ? directProtocol
-        : compatibilityId && typeof totalLayers === 'number'
-          ? 2
-          : undefined
-  };
-  if (compatibilityId && typeof totalLayers === 'number') {
-    metadata.graphV2 = {
-      compatibilityId,
-      totalLayers,
-      ...(readString(graph.vertex_type) ?? readString(graph.vertexType)
-        ? { vertexType: readString(graph.vertex_type) ?? readString(graph.vertexType) }
-        : {}),
-      ...(typeof (readInteger(graph.deadline_unix_ms) ?? readInteger(graph.deadlineUnixMs)) === 'number'
-        ? { deadlineUnixMs: readInteger(graph.deadline_unix_ms) ?? readInteger(graph.deadlineUnixMs) }
-        : {})
-    };
-  }
-  return metadata.allocationProtocol || metadata.graphV2 ? metadata : undefined;
 }
 
 function getBaseScope(scope) {
@@ -648,7 +933,6 @@ function extractHostNodeDetails(nodeId, response) {
           const resourceId = readString(item.resource_id) ?? readString(item.resourceId);
           const artifactHash = readString(item.artifact_hash) ?? readString(item.artifactHash);
           const uidModelName = /^gguf:sha256:/i.test(modelName) ? modelName : undefined;
-          const pipeline = readObject(item.pipeline) ?? readObject(readObject(item.metadata)?.pipeline);
           const rawDisplayName =
             readString(item.display_name) ??
             readString(item.displayName) ??
@@ -661,6 +945,7 @@ function extractHostNodeDetails(nodeId, response) {
             providerModel: readString(item.model) ?? readString(item.provider_model) ?? readString(item.providerModel),
             resourceId,
             artifactHash,
+            capabilities: normalizeModelCapabilities(item),
             hfFilename: readString(item.hf_filename) ?? readString(item.hfFilename),
             localPath: readString(item.local_path) ?? readString(item.localPath),
             assetName: readString(item.assetname) ?? readString(item.assetName),
@@ -670,17 +955,7 @@ function extractHostNodeDetails(nodeId, response) {
                 readString(item.visibilityScope) ??
                 readString(item.scope)
             ),
-            teamName: readString(item.team_name) ?? readString(item.teamName),
-            logicalModelId: readString(pipeline?.logical_model_id) ?? readString(pipeline?.logicalModelId),
-            compatibilityId: readString(pipeline?.compatibility_id) ?? readString(pipeline?.compatibilityId),
-            fragmentStartLayer: readInteger(pipeline?.fragment_start_layer) ?? readInteger(pipeline?.fragmentStartLayer),
-            fragmentEndLayer: readInteger(pipeline?.fragment_end_layer) ?? readInteger(pipeline?.fragmentEndLayer),
-            totalLayers: readInteger(pipeline?.total_layers) ?? readInteger(pipeline?.totalLayers),
-            pipelineProtocolVersion: readInteger(pipeline?.protocol_version) ?? readInteger(pipeline?.protocolVersion),
-            allocationMetadata:
-              extractAllocationMetadata(item) ??
-              extractAllocationMetadata(pipeline) ??
-              extractAllocationMetadata(readObject(item.metadata)?.pipeline)
+            teamName: readString(item.team_name) ?? readString(item.teamName)
           };
         }
         if (!model?.modelName || dedupe.has(model.modelName)) {
@@ -709,7 +984,7 @@ function hostModelMatchesScope(model, requestedScope, requestedTeam) {
 }
 
 function normalizeHostInventoryModelName(model) {
-  const rawName = (model.logicalModelId || model.resourceId || model.modelName || model.assetName || '').trim();
+  const rawName = (model.resourceId || model.modelName || model.assetName || '').trim();
   return stripModelScopeSuffix(rawName);
 }
 
@@ -778,6 +1053,155 @@ function catalogModelMatchesScope(visibility, teamName, requestedScope, requeste
   return !modelTeam || modelTeam === targetTeam;
 }
 
+function readPositiveNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function mergeCapabilities(...sources) {
+  const merged = {};
+  for (const source of sources) {
+    if (!isRecord(source)) {
+      continue;
+    }
+    for (const [key, value] of Object.entries(source)) {
+      if (typeof value === 'undefined' || value === null) {
+        continue;
+      }
+      merged[key] = value;
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function normalizeModelCapabilities(item) {
+  if (!isRecord(item)) {
+    return undefined;
+  }
+  const capabilities = mergeCapabilities(
+    item.capabilities,
+    item.provider_capabilities,
+    item.providerCapabilities,
+    item.host_capabilities,
+    item.hostCapabilities,
+    isRecord(item.metadata) ? item.metadata.capabilities : undefined,
+    isRecord(item.metadata) ? item.metadata.provider_capabilities : undefined,
+    isRecord(item.pipeline) ? item.pipeline.capabilities : undefined
+  );
+  if (!capabilities) {
+    return undefined;
+  }
+  const pipelineSafeContextTokens =
+    readPositiveNumber(capabilities.pipeline_safe_context_tokens) ??
+    readPositiveNumber(capabilities.pipelineSafeContextTokens);
+  const safeContextTokens =
+    readPositiveNumber(capabilities.safe_context_tokens) ??
+    readPositiveNumber(capabilities.safeContextTokens) ??
+    pipelineSafeContextTokens;
+  const contextWindowTokens =
+    readPositiveNumber(capabilities.context_window_tokens) ??
+    readPositiveNumber(capabilities.contextWindowTokens) ??
+    readPositiveNumber(capabilities.context_size) ??
+    readPositiveNumber(capabilities.contextSize);
+  const pipelineMaxSessions =
+    readPositiveNumber(capabilities.pipeline_max_sessions) ??
+    readPositiveNumber(capabilities.pipelineMaxSessions);
+  const minimumContextTokens =
+    readPositiveNumber(capabilities.minimum_context_tokens) ??
+    readPositiveNumber(capabilities.minimumContextTokens) ??
+    readPositiveNumber(capabilities.pipeline_minimum_context_tokens) ??
+    readPositiveNumber(capabilities.pipelineMinimumContextTokens);
+  const desiredContextTokens =
+    readPositiveNumber(capabilities.desired_context_tokens) ??
+    readPositiveNumber(capabilities.desiredContextTokens) ??
+    readPositiveNumber(capabilities.pipeline_desired_context_tokens) ??
+    readPositiveNumber(capabilities.pipelineDesiredContextTokens);
+  const dynamicContextDesiredTokens =
+    readPositiveNumber(capabilities.dynamic_context_desired_tokens) ??
+    readPositiveNumber(capabilities.dynamicContextDesiredTokens);
+  const dynamicContextMinimumTokens =
+    readPositiveNumber(capabilities.dynamic_context_minimum_tokens) ??
+    readPositiveNumber(capabilities.dynamicContextMinimumTokens);
+  const maxContextTokens =
+    readPositiveNumber(capabilities.max_context_tokens) ??
+    readPositiveNumber(capabilities.maxContextTokens);
+  const totalKvCells =
+    readPositiveNumber(capabilities.total_kv_cells) ??
+    readPositiveNumber(capabilities.totalKvCells);
+  const recommendedInputBudgetTokens =
+    readPositiveNumber(capabilities.recommended_input_budget_tokens) ??
+    readPositiveNumber(capabilities.recommendedInputBudgetTokens);
+  const freeSequenceSlots =
+    readPositiveNumber(capabilities.free_sequence_slots) ??
+    readPositiveNumber(capabilities.freeSequenceSlots);
+  return {
+    ...capabilities,
+    ...(pipelineSafeContextTokens ? { pipelineSafeContextTokens, pipeline_safe_context_tokens: pipelineSafeContextTokens } : {}),
+    ...(safeContextTokens ? { safeContextTokens, safe_context_tokens: safeContextTokens } : {}),
+    ...(contextWindowTokens ? { contextWindowTokens, context_window_tokens: contextWindowTokens } : {}),
+    ...(pipelineMaxSessions ? { pipelineMaxSessions, pipeline_max_sessions: pipelineMaxSessions } : {}),
+    ...(minimumContextTokens ? { minimumContextTokens, minimum_context_tokens: minimumContextTokens } : {}),
+    ...(desiredContextTokens ? { desiredContextTokens, desired_context_tokens: desiredContextTokens } : {}),
+    ...(dynamicContextDesiredTokens ? { dynamicContextDesiredTokens, dynamic_context_desired_tokens: dynamicContextDesiredTokens } : {}),
+    ...(dynamicContextMinimumTokens ? { dynamicContextMinimumTokens, dynamic_context_minimum_tokens: dynamicContextMinimumTokens } : {}),
+    ...(maxContextTokens ? { maxContextTokens, max_context_tokens: maxContextTokens } : {}),
+    ...(totalKvCells ? { totalKvCells, total_kv_cells: totalKvCells } : {}),
+    ...(recommendedInputBudgetTokens ? { recommendedInputBudgetTokens, recommended_input_budget_tokens: recommendedInputBudgetTokens } : {}),
+    ...(freeSequenceSlots ? { freeSequenceSlots, free_sequence_slots: freeSequenceSlots } : {})
+  };
+}
+
+function normalizeAllocationMetadata(item) {
+  if (!isRecord(item)) {
+    return undefined;
+  }
+  const metadata = isRecord(item.allocationMetadata)
+    ? item.allocationMetadata
+    : isRecord(item.allocation_metadata)
+      ? item.allocation_metadata
+      : {};
+  const graphSource = isRecord(metadata.graphV2)
+    ? metadata.graphV2
+    : isRecord(metadata.graph_v2)
+      ? metadata.graph_v2
+      : isRecord(item.graphV2)
+        ? item.graphV2
+        : isRecord(item.graph_v2)
+          ? item.graph_v2
+          : {};
+  const allocationProtocol =
+    Number(metadata.allocationProtocol ?? metadata.allocation_protocol ?? item.allocationProtocol ?? item.allocation_protocol ?? 0) ||
+    undefined;
+  const compatibilityId =
+    readString(graphSource.compatibilityId) ??
+    readString(graphSource.compatibility_id) ??
+    readString(item.compatibilityId) ??
+    readString(item.compatibility_id);
+  const totalLayers = Number(graphSource.totalLayers ?? graphSource.total_layers ?? item.totalLayers ?? item.total_layers ?? 0) || undefined;
+  const vertexType =
+    readString(graphSource.vertexType) ??
+    readString(graphSource.vertex_type) ??
+    readString(item.vertexType) ??
+    readString(item.vertex_type);
+  const graphV2 = {};
+  if (compatibilityId) {
+    graphV2.compatibilityId = compatibilityId;
+  }
+  if (totalLayers !== undefined) {
+    graphV2.totalLayers = totalLayers;
+  }
+  if (vertexType) {
+    graphV2.vertexType = vertexType;
+  }
+  if (!allocationProtocol && Object.keys(graphV2).length === 0) {
+    return undefined;
+  }
+  return {
+    allocationProtocol: allocationProtocol ?? 2,
+    ...(Object.keys(graphV2).length > 0 ? { graphV2 } : {})
+  };
+}
+
 function normalizePublicCatalogModels(response, config) {
   const raw = Array.isArray(response?.models)
     ? response.models
@@ -785,18 +1209,33 @@ function normalizePublicCatalogModels(response, config) {
       ? response.data
       : [];
   const models = [];
-  const dedupe = new Set();
+  const byUid = new Map();
+  const addModel = model => {
+    const existing = byUid.get(model.uid);
+    byUid.set(model.uid, {
+      ...existing,
+      ...model,
+      displayName: existing?.displayName && existing.displayName !== existing.uid ? existing.displayName : model.displayName
+    });
+    if (!existing) {
+      models.push(byUid.get(model.uid));
+    } else {
+      const index = models.findIndex(entry => entry.uid === model.uid);
+      if (index >= 0) {
+        models[index] = byUid.get(model.uid);
+      }
+    }
+  };
   for (const item of raw) {
     if (typeof item === 'string') {
       const parsed = parseScopedCatalogModelName(item);
-      if (!parsed.name || dedupe.has(parsed.name)) {
+      if (!parsed.name) {
         continue;
       }
       if (!catalogModelMatchesScope(parsed.visibility, parsed.teamName, config.scope, config.team)) {
         continue;
       }
-      dedupe.add(parsed.name);
-      models.push({
+      addModel({
         uid: parsed.name,
         displayName: parsed.name
       });
@@ -810,7 +1249,7 @@ function normalizePublicCatalogModels(response, config) {
       continue;
     }
     const parsed = parseScopedCatalogModelName(rawName);
-    if (!parsed.name || dedupe.has(parsed.name)) {
+    if (!parsed.name) {
       continue;
     }
     const visibility =
@@ -829,15 +1268,13 @@ function normalizePublicCatalogModels(response, config) {
       readString(item.label) ??
       readString(item.friendly_name) ??
       readString(item.friendlyName);
-    const allocationMetadata =
-      extractAllocationMetadata(item) ??
-      extractAllocationMetadata(readObject(item.pipeline)) ??
-      extractAllocationMetadata(readObject(item.metadata)?.pipeline);
-    dedupe.add(parsed.name);
-    models.push({
+    const allocationMetadata = normalizeAllocationMetadata(item);
+    const capabilities = normalizeModelCapabilities(item);
+    addModel({
       uid: parsed.name,
       displayName: displayName && displayName !== parsed.name ? displayName : parsed.name,
-      ...(allocationMetadata ? { allocationMetadata } : {})
+      ...(allocationMetadata ? { allocationMetadata } : {}),
+      ...(capabilities ? { capabilities } : {})
     });
   }
   return models;
@@ -898,8 +1335,11 @@ async function fetchHostInventoryModels(config, pemContent) {
       if (displayName && existing.displayName === uid) {
         existing.displayName = displayName;
       }
-      if (!existing.allocationMetadata && model.allocationMetadata) {
-        existing.allocationMetadata = model.allocationMetadata;
+      const mergedCapabilities = mergeCapabilities(existing.capabilities, model.capabilities);
+      if (mergedCapabilities) {
+        existing.capabilities = mergedCapabilities;
+      } else {
+        delete existing.capabilities;
       }
       byUid.set(uid, existing);
     }
@@ -921,14 +1361,20 @@ function mergePublicModels(hostModels, catalogModels) {
     if (isHashedModelUid(model.uid) && !displayName) {
       continue;
     }
-    byUid.set(model.uid, {
+    const merged = {
+      ...existing,
+      ...model,
       uid: model.uid,
       displayName,
-      count: existing?.count ?? 0,
-      ...((existing?.allocationMetadata ?? model.allocationMetadata)
-        ? { allocationMetadata: existing?.allocationMetadata ?? model.allocationMetadata }
-        : {})
-    });
+      count: existing?.count ?? 0
+    };
+    const mergedCapabilities = mergeCapabilities(existing?.capabilities, model.capabilities);
+    if (mergedCapabilities) {
+      merged.capabilities = mergedCapabilities;
+    } else {
+      delete merged.capabilities;
+    }
+    byUid.set(model.uid, merged);
   }
   return [...byUid.values()].filter(model => !isHashedModelUid(model.uid) || model.displayName !== model.uid || model.count > 0);
 }
@@ -955,22 +1401,7 @@ async function fetchAvailableModels(config, { forceRefresh = false } = {}) {
       const modelsUrl = buildApiUrl(SPILLI_BACKEND_API_URL, SPILLI_AVAILABLE_MODELS_PATH).toString();
       const response = await requestJsonWithPem(modelsUrl, { scope: 'public' }, pemContent);
       const publicCatalogModels = normalizePublicCatalogModels(response, config);
-      // Match the extension: the public signaling catalog already collapses
-      // physical fragments into a logical model list. Host inventory is only
-      // used as enrichment/availability proof, not as extra selectable entries.
-      const catalogModelsWithLabels = publicCatalogModels.filter(
-        model => !isHashedModelUid(model.uid) || model.displayName
-      );
-      models = catalogModelsWithLabels.map(model => ({
-        ...model,
-        count: hostModels.find(hostModel => hostModel.uid === model.uid)?.count ?? 0,
-        ...((hostModels.find(hostModel => hostModel.uid === model.uid)?.allocationMetadata ?? model.allocationMetadata)
-          ? {
-              allocationMetadata:
-                hostModels.find(hostModel => hostModel.uid === model.uid)?.allocationMetadata ?? model.allocationMetadata
-            }
-          : {})
-      }));
+      models = mergePublicModels(hostModels, publicCatalogModels);
     }
     const catalog = finalizeModelCatalog(config, models);
     state.modelCache = {
@@ -985,6 +1416,29 @@ async function fetchAvailableModels(config, { forceRefresh = false } = {}) {
   } finally {
     state.pendingModelFetch = undefined;
   }
+}
+
+function selectPreferredDisplayMatch(matches) {
+  if (!Array.isArray(matches) || matches.length === 0) {
+    return undefined;
+  }
+  if (matches.length === 1) {
+    return matches[0];
+  }
+  const tiers = [
+    model => !isHashedModelUid(model.uid) && model.allocationMetadata?.allocationProtocol === 2,
+    model => !isHashedModelUid(model.uid) && model.allocationMetadata?.graphV2,
+    model => !isHashedModelUid(model.uid),
+    model => model.allocationMetadata?.allocationProtocol === 2,
+    model => model.allocationMetadata?.graphV2
+  ];
+  for (const predicate of tiers) {
+    const preferred = matches.filter(predicate);
+    if (preferred.length === 1) {
+      return preferred[0];
+    }
+  }
+  return undefined;
 }
 
 function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map()) {
@@ -1004,8 +1458,9 @@ function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map
     return exactApiName;
   }
   const exactDisplayMatches = catalog.models.filter(model => model.displayName === requested);
-  if (exactDisplayMatches.length === 1) {
-    return exactDisplayMatches[0];
+  const exactPreferredDisplayMatch = selectPreferredDisplayMatch(exactDisplayMatches);
+  if (exactPreferredDisplayMatch) {
+    return exactPreferredDisplayMatch;
   }
   if (exactDisplayMatches.length > 1) {
     const choices = exactDisplayMatches.map(model => model.apiName).join(', ');
@@ -1019,8 +1474,9 @@ function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map
     return normalizedApiName;
   }
   const normalizedDisplayMatches = catalog.models.filter(model => normalizeModelLookupName(model.displayName) === normalized);
-  if (normalizedDisplayMatches.length === 1) {
-    return normalizedDisplayMatches[0];
+  const normalizedPreferredDisplayMatch = selectPreferredDisplayMatch(normalizedDisplayMatches);
+  if (normalizedPreferredDisplayMatch) {
+    return normalizedPreferredDisplayMatch;
   }
   if (normalizedDisplayMatches.length > 1) {
     const choices = normalizedDisplayMatches.map(model => model.apiName).join(', ');
@@ -1136,7 +1592,11 @@ function toToolCall(value) {
     value.type === 'function_call' || value.type === 'custom_tool_call' || typeof value.call_id === 'string' || typeof value.arguments !== 'undefined'
       ? value.name
       : undefined;
-  const toolName = asString(value.toolName || responseFunctionName).trim();
+  const wrapperFunctionName =
+    typeof value.input !== 'undefined' || typeof value.args !== 'undefined'
+      ? value.name || value.tool || value.tool_name || value.toolName
+      : undefined;
+  const toolName = asString(value.toolName || responseFunctionName || wrapperFunctionName).trim();
   if (!toolName) {
     return undefined;
   }
@@ -1152,6 +1612,8 @@ function toToolCall(value) {
         ? value.arguments
         : value.type === 'custom_tool_call'
           ? value.input
+          : isRecord(value.input)
+            ? value.input
           : undefined
   );
   const input = value.type === 'custom_tool_call' && typeof value.input === 'string' ? value.input : args;
@@ -1197,7 +1659,10 @@ function collectToolCalls(value, calls) {
 }
 
 function normalizeToolNameForLookup(value) {
-  return asString(value).trim().toLowerCase();
+  return asString(value)
+    .trim()
+    .replace(/^(?:tool|tools|function|functions)\./i, '')
+    .toLowerCase();
 }
 
 function catalogCacheKey(config) {
@@ -1243,7 +1708,19 @@ function resolveAllowedToolName(name, allowedToolNames = []) {
   }
   const aliases = new Map([
     ['shell', 'Bash'],
-    ['terminal', 'Bash']
+    ['terminal', 'Bash'],
+    ['tool_bash', 'Bash'],
+    ['bash_tool', 'Bash'],
+    ['read_file', 'Read'],
+    ['file_read', 'Read'],
+    ['fileread', 'Read'],
+    ['repo_browser.read_file', 'Read'],
+    ['write_file', 'Write'],
+    ['file_write', 'Write'],
+    ['filewrite', 'Write'],
+    ['edit_file', 'Edit'],
+    ['file_edit', 'Edit'],
+    ['fileedit', 'Edit']
   ]);
   const preferred = aliases.get(normalizeToolNameForLookup(trimmed)) ?? trimmed;
   if (!allowedToolNames.length) {
@@ -1280,6 +1757,37 @@ function pseudoToolBaseName(name) {
   return normalizeToolNameForLookup(name).split(/[:\s]/)[0];
 }
 
+function pseudoToolNameVariants(name) {
+  const normalized = pseudoToolBaseName(name);
+  const variants = new Set([normalized]);
+  for (const separator of ['.', '_', '-']) {
+    const [prefix] = normalized.split(separator);
+    if (prefix) {
+      variants.add(prefix);
+    }
+  }
+  return variants;
+}
+
+function isExplorePseudoToolName(name) {
+  const normalized = pseudoToolBaseName(name);
+  const variants = pseudoToolNameVariants(name);
+  return (
+    ['explore', 'search', 'browse', 'repo_browser', 'repo_browser.search', 'codebase.search', 'workspace.search', 'grep', 'rg', 'ripgrep'].includes(normalized) ||
+    variants.has('explore') ||
+    variants.has('search') ||
+    variants.has('browse') ||
+    variants.has('repo') ||
+    variants.has('repo_browser') ||
+    variants.has('codebase') ||
+    variants.has('workspace')
+  );
+}
+
+function isAgentPseudoToolName(name) {
+  return pseudoToolNameVariants(name).has('agent');
+}
+
 function pseudoToolDescription(name, input) {
   const normalized = pseudoToolBaseName(name);
   return (
@@ -1295,10 +1803,11 @@ function normalizeAgentToolInput(call) {
     return input;
   }
   const normalized = pseudoToolBaseName(call.name);
+  const exploreLike = isExplorePseudoToolName(call.name);
   const subagentType =
     isRecord(input) && typeof input.subagent_type === 'string'
       ? input.subagent_type
-      : normalized === 'explore'
+      : exploreLike
         ? 'Explore'
         : 'general-purpose';
   return {
@@ -1310,8 +1819,10 @@ function normalizeAgentToolInput(call) {
 
 function aliasPseudoToolCall(call, allowedToolNames = []) {
   const pseudoName = pseudoToolBaseName(call.name);
+  const exploreLike = isExplorePseudoToolName(call.name);
+  const agentLike = isAgentPseudoToolName(call.name);
   const agentToolName = resolveAllowedToolName('Agent', allowedToolNames);
-  if (agentToolName && ['agent', 'explore', 'search', 'browse'].includes(pseudoName)) {
+  if (agentToolName && (agentLike || exploreLike)) {
     return {
       ...call,
       name: agentToolName,
@@ -1319,14 +1830,14 @@ function aliasPseudoToolCall(call, allowedToolNames = []) {
     };
   }
   const taskToolName = resolveAllowedToolName('Task', allowedToolNames);
-  if (taskToolName && ['agent', 'explore', 'search', 'browse'].includes(pseudoName)) {
+  if (taskToolName && (agentLike || exploreLike)) {
     return {
       ...call,
       name: taskToolName,
       input: {
         description: pseudoToolDescription(call.name, call.input),
         prompt: formatPseudoToolPrompt(call.name, call.input),
-        subagent_type: pseudoName === 'explore' ? 'Explore' : 'general-purpose'
+        subagent_type: exploreLike ? 'Explore' : 'general-purpose'
       }
     };
   }
@@ -1338,28 +1849,460 @@ function sanitizeToolInput(name, input) {
     return input;
   }
   const normalizedName = normalizeToolNameForLookup(name);
+  if (normalizedName === 'web_search' || normalizedName === 'websearch') {
+    const query = asString(input.query || input.search_query || input.q).trim();
+    return query ? { query } : {};
+  }
   const sanitized = { ...input };
   if (normalizedName === 'read') {
+    if (!asString(sanitized.file_path).trim()) {
+      const filePath = asString(sanitized.path || sanitized.file || sanitized.filename).trim();
+      if (filePath) {
+        sanitized.file_path = filePath;
+      }
+    }
+    const lineStart = Number.parseInt(sanitized.line_start ?? sanitized.start, 10);
+    const lineEnd = Number.parseInt(sanitized.line_end ?? sanitized.end, 10);
+    if (!Object.hasOwn(sanitized, 'offset') && Number.isFinite(lineStart) && lineStart > 0) {
+      sanitized.offset = lineStart;
+    }
+    if (
+      !Object.hasOwn(sanitized, 'limit') &&
+      Number.isFinite(lineStart) &&
+      lineStart > 0 &&
+      Number.isFinite(lineEnd) &&
+      lineEnd >= lineStart
+    ) {
+      sanitized.limit = lineEnd - lineStart + 1;
+    }
+    delete sanitized.path;
+    delete sanitized.file;
+    delete sanitized.filename;
     delete sanitized.lines;
     delete sanitized.line;
+    delete sanitized.line_start;
+    delete sanitized.line_end;
+    delete sanitized.start;
+    delete sanitized.end;
+  }
+  if (normalizedName === 'write') {
+    if (!asString(sanitized.file_path).trim()) {
+      const filePath = asString(sanitized.path || sanitized.file || sanitized.filename).trim();
+      if (filePath) {
+        sanitized.file_path = filePath;
+      }
+    }
+    if (typeof sanitized.content !== 'string') {
+      const content = asString(sanitized.text || sanitized.data || sanitized.append).trim();
+      if (content) {
+        sanitized.content = content;
+      }
+    }
+    delete sanitized.path;
+    delete sanitized.file;
+    delete sanitized.filename;
+    delete sanitized.text;
+    delete sanitized.data;
+    delete sanitized.append;
+    delete sanitized.mode;
+  }
+  if (normalizedName === 'edit') {
+    if (!asString(sanitized.file_path).trim()) {
+      const filePath = asString(sanitized.path || sanitized.file || sanitized.filename).trim();
+      if (filePath) {
+        sanitized.file_path = filePath;
+      }
+    }
+    delete sanitized.path;
+    delete sanitized.file;
+    delete sanitized.filename;
+    delete sanitized.mode;
   }
   if (normalizedName === 'agent') {
     delete sanitized.callId;
     delete sanitized.call_id;
   }
+  if (normalizedName === 'bash') {
+    if (Array.isArray(sanitized.command)) {
+      sanitized.command =
+        sanitized.command.length >= 3 &&
+        String(sanitized.command[0]) === 'bash' &&
+        String(sanitized.command[1]) === '-lc'
+          ? String(sanitized.command.slice(2).join(' '))
+          : sanitized.command.map(part => String(part)).join(' ');
+    } else if (!asString(sanitized.command).trim() && Array.isArray(sanitized.cmd)) {
+      sanitized.command =
+        sanitized.cmd.length >= 3 &&
+        String(sanitized.cmd[0]) === 'bash' &&
+        String(sanitized.cmd[1]) === '-lc'
+          ? String(sanitized.cmd.slice(2).join(' '))
+          : sanitized.cmd.map(part => String(part)).join(' ');
+      delete sanitized.cmd;
+    } else if (!asString(sanitized.command).trim() && typeof sanitized.cmd === 'string') {
+      sanitized.command = sanitized.cmd;
+      delete sanitized.cmd;
+    }
+  }
   return sanitized;
 }
 
+function shellQuote(value) {
+  return `'${String(value ?? '').replace(/'/g, `'\\''`)}'`;
+}
+
+function commandFromArgv(value) {
+  if (Array.isArray(value)) {
+    if (value.length >= 3 && String(value[0]) === 'bash' && String(value[1]) === '-lc') {
+      return String(value.slice(2).join(' '));
+    }
+    return value.map(part => String(part)).join(' ');
+  }
+  return asString(value).trim();
+}
+
+function aliasShellPseudoToolCall(call, allowedToolNames = []) {
+  const bashToolName = resolveAllowedToolName('Bash', allowedToolNames);
+  if (!bashToolName) {
+    return undefined;
+  }
+  const normalized = normalizeToolNameForLookup(call.name);
+  const input = isRecord(call.input) ? call.input : {};
+  if (
+    normalized === 'container.exec' ||
+    normalized === 'exec_command' ||
+    normalized === 'tool_bash' ||
+    (normalized.startsWith('toolu_') && (Object.hasOwn(input, 'command') || Object.hasOwn(input, 'cmd')))
+  ) {
+    const command = commandFromArgv(input.command || input.cmd);
+    return command ? { ...call, name: bashToolName, input: { command } } : undefined;
+  }
+  if (normalized === 'repo_browser.print_tree') {
+    const targetPath = asString(input.path).trim() || '.';
+    const depth = Math.max(1, Math.min(8, Number.parseInt(input.depth, 10) || 3));
+    return {
+      ...call,
+      name: bashToolName,
+      input: {
+        command: `find ${shellQuote(targetPath)} -maxdepth ${depth} -print | sed -n '1,200p'`
+      }
+    };
+  }
+  if (normalized === 'repo_browser.search' || normalized === 'repo_browser.find') {
+    const targetPath = asString(input.path).trim() || '.';
+    const query = asString(input.query || input.pattern || input.search).trim();
+    if (!query) {
+      return undefined;
+    }
+    return {
+      ...call,
+      name: bashToolName,
+      input: {
+        command: `grep -RIn --exclude-dir=.git --exclude-dir=node_modules -- ${shellQuote(query)} ${shellQuote(targetPath)} | head -100`
+      }
+    };
+  }
+  if (normalized === 'repo_browser.open_file' || normalized === 'open_file') {
+    const targetPath = asString(input.path || input.file).trim();
+    if (!targetPath) {
+      return undefined;
+    }
+    const start = Math.max(1, Number.parseInt(input.line_start || input.start || 1, 10) || 1);
+    const end = Math.max(start, Number.parseInt(input.line_end || input.end || start + 199, 10) || start + 199);
+    return {
+      ...call,
+      name: bashToolName,
+      input: {
+        command: `sed -n '${start},${end}p' ${shellQuote(targetPath)}`
+      }
+    };
+  }
+  return undefined;
+}
+
+function aliasFilePseudoToolCall(call, allowedToolNames = []) {
+  const normalized = normalizeToolNameForLookup(call.name);
+  const input = isRecord(call.input) ? call.input : {};
+  const requestedAction = asString(input.action || input.operation).trim().toLowerCase();
+  const appendMode =
+    ['a', 'append'].includes(asString(input.mode).trim().toLowerCase()) ||
+    requestedAction === 'append' ||
+    typeof input.append === 'string';
+  const prependMode = requestedAction === 'prepend';
+  const bashToolName = resolveAllowedToolName('Bash', allowedToolNames);
+  if (
+    normalized === 'edit' &&
+    isRecord(input) &&
+    asString(input.file_path || input.path || input.file || input.filename).trim() &&
+    (appendMode || prependMode)
+  ) {
+    const filePath = asString(input.file_path || input.path || input.file || input.filename).trim();
+    const content =
+      typeof input.new_content === 'string'
+        ? input.new_content
+        : typeof input.newString === 'string'
+          ? input.newString
+          : typeof input.new_string === 'string'
+            ? input.new_string
+            : typeof input.content === 'string'
+              ? input.content
+              : typeof input.append === 'string'
+                ? input.append
+                : '';
+    if (!content || !bashToolName) {
+      return undefined;
+    }
+    const command = prependMode
+      ? `tmp=$(mktemp) && printf %s ${shellQuote(content)} > "$tmp" && cat ${shellQuote(filePath)} >> "$tmp" && mv "$tmp" ${shellQuote(filePath)}`
+      : `printf %s ${shellQuote(content)} >> ${shellQuote(filePath)}`;
+    return { ...call, name: bashToolName, input: { command } };
+  }
+  if (
+    normalized === 'edit' &&
+    isRecord(input) &&
+    asString(input.file_path || input.path || input.file || input.filename).trim() &&
+    typeof input.old_string === 'string' &&
+    input.old_string.length === 0 &&
+    typeof input.new_string === 'string'
+  ) {
+    const filePath = asString(input.file_path || input.path || input.file || input.filename).trim();
+    return bashToolName
+      ? { ...call, name: bashToolName, input: { command: `printf %s ${shellQuote(input.new_string)} >> ${shellQuote(filePath)}` } }
+      : undefined;
+  }
+  if (normalized === 'repo_browser.read_file' || normalized === 'read_file' || normalized === 'file_read' || normalized === 'fileread') {
+    const readToolName = resolveAllowedToolName('Read', allowedToolNames);
+    if (!readToolName) {
+      return undefined;
+    }
+    const filePath = asString(input.file_path || input.path || input.file || input.filename).trim();
+    return filePath ? { ...call, name: readToolName, input: { ...input, file_path: filePath } } : undefined;
+  }
+  if (normalized === 'write_file' || normalized === 'file_write' || normalized === 'filewrite') {
+    const writeToolName = resolveAllowedToolName('Write', allowedToolNames);
+    if (!writeToolName) {
+      return undefined;
+    }
+    const filePath = asString(input.file_path || input.path || input.file || input.filename).trim();
+    if (!filePath) {
+      return undefined;
+    }
+    const content =
+      typeof input.content === 'string'
+        ? input.content
+        : typeof input.text === 'string'
+          ? input.text
+          : typeof input.data === 'string'
+            ? input.data
+            : typeof input.append === 'string'
+              ? input.append
+              : '';
+    if (appendMode) {
+      return bashToolName
+        ? { ...call, name: bashToolName, input: { command: `printf %s ${shellQuote(content)} >> ${shellQuote(filePath)}` } }
+        : undefined;
+    }
+    return { ...call, name: writeToolName, input: { ...input, file_path: filePath, content } };
+  }
+  if (normalized === 'fileedit' || normalized === 'file_edit' || normalized === 'edit_file') {
+    const editToolName = resolveAllowedToolName('Edit', allowedToolNames);
+    const writeToolName = resolveAllowedToolName('Write', allowedToolNames);
+    const filePath = asString(input.file_path || input.path || input.file || input.filename).trim();
+    if (!filePath) {
+      return undefined;
+    }
+    const content =
+      typeof input.content === 'string'
+        ? input.content
+        : typeof input.text === 'string'
+          ? input.text
+          : typeof input.data === 'string'
+            ? input.data
+            : typeof input.append === 'string'
+              ? input.append
+              : '';
+    if (appendMode) {
+      return bashToolName
+        ? { ...call, name: bashToolName, input: { command: `printf %s ${shellQuote(content)} >> ${shellQuote(filePath)}` } }
+        : undefined;
+    }
+    const selectedToolName = editToolName || writeToolName;
+    if (!selectedToolName) {
+      return undefined;
+    }
+    return {
+      ...call,
+      name: selectedToolName,
+      input: { ...input, file_path: filePath, content }
+    };
+  }
+  if (normalized === 'write') {
+    const filePath = asString(input.file_path || input.path || input.file || input.filename).trim();
+    const content = typeof input.content === 'string'
+      ? input.content
+      : typeof input.text === 'string'
+        ? input.text
+        : typeof input.data === 'string'
+          ? input.data
+          : typeof input.append === 'string'
+            ? input.append
+            : '';
+    if (!filePath || typeof content !== 'string') {
+      return undefined;
+    }
+    if (appendMode) {
+      return bashToolName
+        ? { ...call, name: bashToolName, input: { command: `printf %s ${shellQuote(content)} >> ${shellQuote(filePath)}` } }
+        : undefined;
+    }
+    const existing = readExistingLocalToolFile(filePath);
+    if (existing !== undefined && content.startsWith(existing) && content.length > existing.length) {
+      const suffix = content.slice(existing.length);
+      return bashToolName
+        ? { ...call, name: bashToolName, input: { command: `printf %s ${shellQuote(suffix)} >> ${shellQuote(filePath)}` } }
+        : undefined;
+    }
+    if (existing !== undefined) {
+      return bashToolName
+        ? {
+            ...call,
+            name: bashToolName,
+            input: {
+              command: [
+                'printf %s',
+                shellQuote(
+                  [
+                    'SpiLLI bridge blocked an unsafe Write tool call.',
+                    `The model attempted to overwrite existing file ${filePath} with reconstructed content.`,
+                    'Use Edit with old_string/new_string for targeted modifications, or Bash with a shell append command if Bash is available.'
+                  ].join('\n')
+                ),
+                '>&2',
+                'exit 1'
+              ].join(' ')
+            }
+          }
+        : undefined;
+    }
+  }
+  return undefined;
+}
+
+function readExistingLocalToolFile(filePath) {
+  const normalizedPath = asString(filePath).trim();
+  if (!normalizedPath) {
+    return undefined;
+  }
+  try {
+    const resolvedPath = path.isAbsolute(normalizedPath)
+      ? normalizedPath
+      : path.resolve(process.cwd(), normalizedPath);
+    const stat = fs.statSync(resolvedPath, { throwIfNoEntry: false });
+    if (!stat?.isFile()) {
+      return undefined;
+    }
+    return fs.readFileSync(resolvedPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+function contentContainsCompactionArtifact(content) {
+  const text = String(content ?? '');
+  return (
+    /\[(?:tail excerpt|head excerpt|compacted tool result|summarized earlier conversation by SpiLLI API bridge)/i.test(text) ||
+    /\[\.\.\.\s*\d+\s+(?:characters|tokens|lines)\s+omitted/i.test(text) ||
+    /\[\.\.\.\s*[\s\S]{0,120}\s+omitted from (?:older conversation history|latest history item|tool result) by SpiLLI API bridge/i.test(text)
+  );
+}
+
+function isUnsafeNativeFileToolCall(call) {
+  const normalized = normalizeToolNameForLookup(call?.name);
+  if (normalized !== 'write') {
+    return false;
+  }
+  const input = isRecord(call.input) ? call.input : {};
+  const content = typeof input.content === 'string' ? input.content : undefined;
+  if (typeof content !== 'string') {
+    return false;
+  }
+  if (contentContainsCompactionArtifact(content)) {
+    return true;
+  }
+  const filePath = asString(input.file_path || input.path || input.file || input.filename).trim();
+  const existing = readExistingLocalToolFile(filePath);
+  return existing !== undefined && content !== existing;
+}
+
+function unwrapGenericToolRunCall(call) {
+  const normalized = normalizeToolNameForLookup(call?.name);
+  if (!['tool.run', 'run_tool', 'tool_run'].includes(normalized)) {
+    return call;
+  }
+  const input = isRecord(call.input) ? call.input : {};
+  const name = asString(input.name || input.tool || input.tool_name || input.toolName).trim();
+  if (!name) {
+    return call;
+  }
+  const args = isRecord(input.arguments)
+    ? input.arguments
+    : isRecord(input.args)
+      ? input.args
+      : isRecord(input.input)
+        ? input.input
+        : {};
+  return {
+    ...call,
+    name,
+    input: args
+  };
+}
+
+function inferAnonymousToolCall(call) {
+  if (asString(call?.name).trim()) {
+    return call;
+  }
+  const input = isRecord(call?.input) ? call.input : {};
+  const query = asString(input.query || input.pattern || input.search).trim();
+  if (!query) {
+    return call;
+  }
+  if (
+    Object.hasOwn(input, 'path') ||
+    Object.hasOwn(input, 'max_results') ||
+    Object.hasOwn(input, 'pattern') ||
+    Object.hasOwn(input, 'search')
+  ) {
+    return {
+      ...call,
+      name: 'repo_browser.search',
+      input
+    };
+  }
+  return call;
+}
+
 function normalizeToolCallForAllowedTools(call, allowedToolNames = []) {
-  const allowedName = resolveAllowedToolName(call.name, allowedToolNames);
+  const unwrappedCall = inferAnonymousToolCall(unwrapGenericToolRunCall(call));
+  const fileAliased = aliasFilePseudoToolCall(unwrappedCall, allowedToolNames);
+  if (fileAliased) {
+    return { ...fileAliased, input: sanitizeToolInput(fileAliased.name, fileAliased.input) };
+  }
+  if (isUnsafeNativeFileToolCall(unwrappedCall)) {
+    return undefined;
+  }
+  const allowedName = resolveAllowedToolName(unwrappedCall.name, allowedToolNames);
   if (allowedName) {
-    const normalized = { ...call, name: allowedName };
+    const normalized = { ...unwrappedCall, name: allowedName };
     const input = normalizeToolNameForLookup(allowedName) === 'agent'
       ? normalizeAgentToolInput(normalized)
       : normalized.input;
     return { ...normalized, input: sanitizeToolInput(allowedName, input) };
   }
-  const aliased = aliasPseudoToolCall(call, allowedToolNames);
+  const shellAliased = aliasShellPseudoToolCall(unwrappedCall, allowedToolNames);
+  if (shellAliased) {
+    return { ...shellAliased, input: sanitizeToolInput(shellAliased.name, shellAliased.input) };
+  }
+  const aliased = aliasPseudoToolCall(unwrappedCall, allowedToolNames);
   return aliased ? { ...aliased, input: sanitizeToolInput(aliased.name, aliased.input) } : undefined;
 }
 
@@ -1437,14 +2380,25 @@ function parseToolCallsFromOutput(raw, allowedToolNames = []) {
   if (parsedHarmony.isHarmony) {
     for (const segment of parsedHarmony.messages) {
       const hasRecipient = typeof segment.recipient === 'string' && segment.recipient.trim();
-      const isToolish = segment.terminator === 'call' || (hasRecipient && segment.terminator === 'end');
+      const channelName = asString(segment.channel).trim().split(/\s+/)[0].toLowerCase();
+      const anonymousCommentaryJson =
+        !hasRecipient && channelName === 'commentary' && segment.content.trim().startsWith('{');
+      const isToolish =
+        segment.terminator === 'call' || (hasRecipient && segment.terminator === 'end') || anonymousCommentaryJson;
       if (!isToolish) {
         continue;
       }
       const parsed = tryParseJson(segment.content.trim());
       const parsedContent = isRecord(parsed) ? parsed : {};
-      const rawName = asString(parsedContent.toolName || segment.recipient).trim();
-      if (!rawName) {
+      const payloadToolName = asString(
+        parsedContent.toolName ||
+          parsedContent.name ||
+          parsedContent.tool ||
+          parsedContent.tool_name ||
+          parsedContent.toolName
+      ).trim();
+      const rawName = payloadToolName || asString(segment.recipient).trim();
+      if (!rawName && !isRecord(parsed)) {
         continue;
       }
       const input = isRecord(parsedContent.args)
@@ -1454,6 +2408,10 @@ function parseToolCallsFromOutput(raw, allowedToolNames = []) {
             ...(typeof parsedContent.description === 'string' ? { description: parsedContent.description } : {}),
             ...(typeof parsedContent.prompt === 'string' ? { prompt: parsedContent.prompt } : {})
           }
+        : isRecord(parsedContent.arguments)
+          ? parsedContent.arguments
+          : isRecord(parsedContent.input)
+            ? parsedContent.input
         : isRecord(parsed)
           ? parsedContent
           : segment.content.trim();
@@ -1502,8 +2460,69 @@ function stripDisplaySections(text) {
 function stripHarmonyControlTokens(text) {
   return String(text ?? '')
     .replace(/<\|(?:start|end|call|return|channel|message|constrain)\|>/g, '')
+    .replace(/\|<stop_reason>\|[\s\S]*?\|<\/stop_reason>\|/g, '')
     .replace(/\[EOG\]\s*$/g, '')
     .trim();
+}
+
+function extractSpilliStopReason(raw) {
+  const match = String(raw ?? '').match(/\|<stop_reason>\|([\s\S]*?)\|<\/stop_reason>\|/);
+  const reason = match?.[1]?.trim();
+  return reason === 'max_tokens' ? 'max_tokens' : undefined;
+}
+
+function createBridgeToolUseId(prefix = 'toolu_spilli') {
+  return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`.slice(0, 64);
+}
+
+function buildContinueAfterMaxTokensQuestion() {
+  const question = 'Generation reached the configured token limit. Would you like SpiLLI to continue generating from the current session?';
+  return {
+    questions: [
+      {
+        question,
+        header: 'Continue?',
+        options: [
+          {
+            label: 'Continue',
+            description: 'Ask the model to keep generating from the current warm context.'
+          },
+          {
+            label: 'Stop',
+            description: 'Stop here and keep the current partial response.'
+          }
+        ],
+        multiSelect: false
+      }
+    ]
+  };
+}
+
+function shouldAskContinueAfterMaxTokens({ stopReason, toolCalls, allowedToolNames, config }) {
+  if (stopReason !== 'max_tokens' || toolCalls.length > 0 || config?.askContinueOnMaxTokens === false) {
+    return false;
+  }
+  return Boolean(resolveAllowedToolName('AskUserQuestion', allowedToolNames));
+}
+
+function readPositiveInteger(value) {
+  if (value === null || value === undefined || value === '') {
+    return undefined;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function maxTokensFromAnthropicBody(body) {
+  return readPositiveInteger(body?.max_tokens);
+}
+
+function maxTokensFromOpenAiChatBody(body) {
+  return readPositiveInteger(body?.max_completion_tokens) ?? readPositiveInteger(body?.max_tokens);
+}
+
+function maxTokensFromResponsesBody(body) {
+  return readPositiveInteger(body?.max_output_tokens);
 }
 
 function extractHarmonyChannelText(raw, channelName) {
@@ -1545,14 +2564,20 @@ function extractHarmonyChannelText(raw, channelName) {
 function extractHarmonyFinalText(raw) {
   const parsed = parseHarmonyOutput(raw);
   if (parsed.isHarmony) {
-    const parsedFinal = parsed.messages
+    const parsedFinalMessages = parsed.messages
       .filter(segment => asString(segment.channel).trim().split(/\s+/)[0] === 'final')
       .map(segment => stripHarmonyControlTokens(segment.content))
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-    if (parsedFinal) {
-      return parsedFinal;
+      .map(text => text.trim())
+      .filter(Boolean);
+    if (parsedFinalMessages.length === 1) {
+      return parsedFinalMessages[0];
+    }
+    if (parsedFinalMessages.length > 1) {
+      const substantive = parsedFinalMessages
+        .filter(text => text.length >= 80)
+        .filter(text => !/^this is the end of the conversation\.?$/i.test(text.trim()));
+      const candidates = substantive.length > 0 ? substantive : parsedFinalMessages;
+      return candidates.reduce((best, text) => (text.length > best.length ? text : best), candidates[0]);
     }
   }
   return extractHarmonyChannelText(raw, 'final');
@@ -1572,35 +2597,385 @@ function renderText(raw, toolCalls) {
   return stripHarmonyControlTokens(text);
 }
 
-function normalizeContent(content) {
+function normalizeWebSearchResultBlock(part) {
+  const title = asString(part.title || part.document_title).trim();
+  const url = asString(part.url).trim();
+  const pageAge = asString(part.page_age || part.pageAge).trim();
+  const citedText = asString(part.cited_text || part.citedText || part.text || part.snippet).trim();
+  const lines = [];
+  if (title || url) {
+    lines.push(`- ${title || url}${url && title ? ` (${url})` : ''}`);
+  }
+  if (pageAge) {
+    lines.push(`  Page age: ${pageAge}`);
+  }
+  if (citedText) {
+    lines.push(`  Excerpt: ${citedText}`);
+  }
+  return lines.join('\n');
+}
+
+function clipForModelContext(text, maxChars, label = 'content') {
+  const normalized = asString(text);
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || normalized.length <= maxChars) {
+    return normalized;
+  }
+  const headLength = Math.max(0, Math.floor(maxChars * 0.7));
+  const tailLength = Math.max(0, maxChars - headLength);
+  const omitted = normalized.length - headLength - tailLength;
+  return [
+    normalized.slice(0, headLength).trimEnd(),
+    `[... ${omitted} characters omitted from ${label} by SpiLLI API bridge ...]`,
+    normalized.slice(normalized.length - tailLength).trimStart()
+  ].join('\n');
+}
+
+function takeLinesWithinBudget(lines, maxChars) {
+  const kept = [];
+  let used = 0;
+  for (const line of lines) {
+    const next = asString(line);
+    const cost = next.length + 1;
+    if (kept.length > 0 && used + cost > maxChars) {
+      break;
+    }
+    kept.push(next);
+    used += cost;
+  }
+  return kept.join('\n');
+}
+
+function compactGrepLikeOutput(text, targetChars) {
+  const lines = asString(text).split(/\r?\n/).filter(Boolean);
+  const grepLines = lines.filter(line => /^[^:\n]+:\d+(?::\d+)?:/.test(line));
+  if (grepLines.length < Math.max(2, Math.floor(lines.length * 0.4))) {
+    return undefined;
+  }
+  const byFile = new Map();
+  for (const line of grepLines) {
+    const file = line.match(/^([^:\n]+):\d+(?::\d+)?:/)?.[1] || 'matches';
+    const bucket = byFile.get(file) || [];
+    if (bucket.length < 4) {
+      bucket.push(line);
+    }
+    byFile.set(file, bucket);
+  }
+  const compacted = [];
+  compacted.push(`Matched ${grepLines.length} lines across ${byFile.size} files.`);
+  for (const [file, fileLines] of byFile.entries()) {
+    compacted.push(`\n${file}`);
+    compacted.push(...fileLines.map(line => `  ${line}`));
+    if (takeLinesWithinBudget(compacted, targetChars).length >= targetChars) {
+      break;
+    }
+  }
+  return takeLinesWithinBudget(compacted, targetChars);
+}
+
+function compactJsonLikeOutput(text, targetChars) {
+  const parsed = tryParseJson(asString(text).trim());
+  if (!parsed) {
+    return undefined;
+  }
+  const seen = new WeakSet();
+  const simplify = value => {
+    if (Array.isArray(value)) {
+      return value.slice(0, 20).map(simplify);
+    }
+    if (isRecord(value)) {
+      if (seen.has(value)) {
+        return '[Circular]';
+      }
+      seen.add(value);
+      const out = {};
+      for (const [key, item] of Object.entries(value).slice(0, 30)) {
+        if (typeof item === 'string') {
+          out[key] = item.length > 600 ? `${item.slice(0, 600)}... [${item.length - 600} chars omitted]` : item;
+        } else {
+          out[key] = simplify(item);
+        }
+      }
+      return out;
+    }
+    return value;
+  };
+  return clipForModelContext(JSON.stringify(simplify(parsed), null, 2), targetChars, 'JSON tool result');
+}
+
+function compactGenericOutput(text, targetChars) {
+  const normalized = asString(text).trim();
+  if (normalized.length <= targetChars) {
+    return normalized;
+  }
+  const lines = normalized.split(/\r?\n/);
+  if (lines.length <= 2) {
+    return clipForModelContext(normalized, targetChars, 'single-line tool result');
+  }
+  const informative = lines.filter(line => line.trim()).slice(0, 200);
+  const headerLike = informative.filter(line =>
+    /^\s*(?:class|def|function|const|let|var|export|import|async|#|##|\*|-|\d+\.|\w[\w.-]+:)/.test(line)
+  );
+  const candidates = headerLike.length >= 8 ? headerLike : informative;
+  const headBudget = Math.floor(targetChars * 0.7);
+  const tailBudget = Math.max(0, targetChars - headBudget - 160);
+  const head = takeLinesWithinBudget(candidates, headBudget);
+  const tail = tailBudget > 0 ? takeLinesWithinBudget(lines.slice(-40), tailBudget) : '';
+  return [head, tail ? '\n[tail excerpt]\n' + tail : ''].filter(Boolean).join('');
+}
+
+function compactToolResultForModelContext(text, options = {}) {
+  const normalized = asString(text);
+  const rawLimit = Number.isFinite(options.toolResultRawChars)
+    ? options.toolResultRawChars
+    : DEFAULT_TOOL_RESULT_RAW_CHARS;
+  const compactLimit = Number.isFinite(options.toolResultCompactChars)
+    ? options.toolResultCompactChars
+    : DEFAULT_TOOL_RESULT_COMPACT_CHARS;
+  const compactTarget = Number.isFinite(options.toolResultCompactTargetChars)
+    ? options.toolResultCompactTargetChars
+    : DEFAULT_TOOL_RESULT_COMPACT_TARGET_CHARS;
+  const summaryTarget = Number.isFinite(options.toolResultSummaryTargetChars)
+    ? options.toolResultSummaryTargetChars
+    : DEFAULT_TOOL_RESULT_SUMMARY_TARGET_CHARS;
+  if (normalized.length <= rawLimit) {
+    return normalized;
+  }
+  const needsSummarizer = normalized.length > compactLimit;
+  const target = needsSummarizer ? summaryTarget : compactTarget;
+  const compacted =
+    compactGrepLikeOutput(normalized, target) ||
+    compactJsonLikeOutput(normalized, target) ||
+    compactGenericOutput(normalized, target);
+  const mode = needsSummarizer ? 'summarizer-recommended deterministic pre-summary' : 'deterministic';
+  const endpoint = asString(options.toolResultSummarizerEndpoint).trim();
+  const summarizerHint = needsSummarizer
+    ? endpoint
+      ? `\nSummarizer endpoint configured: ${endpoint}`
+      : '\nSummarizer endpoint not configured; using deterministic pre-summary.'
+    : '';
+  return [
+    `[compacted tool result: mode=${mode}; original_chars=${normalized.length}; compacted_chars=${compacted.length}]${summarizerHint}`,
+    compacted
+  ].join('\n');
+}
+
+function buildSummarizedToolResultText({ originalText, summaryText, toolUseId, targetChars }) {
+  const summary = clipForModelContext(summaryText, targetChars, `summary for ${toolUseId || 'tool result'}`).trim();
+  return [
+    `[summarized tool result: original_chars=${asString(originalText).length}; summary_chars=${summary.length}; summarizer=spilli-sdk]`,
+    summary
+  ].join('\n');
+}
+
+async function summarizeTextWithSpilliSdk({
+  text,
+  model,
+  config,
+  instruction = '',
+  targetChars = DEFAULT_TOOL_RESULT_SUMMARY_TARGET_CHARS,
+  source = 'tool_result'
+}) {
+  const normalized = asString(text).trim();
+  if (!normalized) {
+    return '';
+  }
+  const requestedModel = asString(model || config.toolResultSummarizerModel).trim();
+  if (!requestedModel) {
+    throw Object.assign(new Error('A model is required for SpiLLI summarization.'), { statusCode: 400 });
+  }
+  const resolvedModel = await resolveRequestedModel(requestedModel, config);
+  const resource = buildResource(resolvedModel, config);
+  const service = getService(config);
+  const session = await requestSpilliSessionForResource(service, resource, config.allocationTimeoutMs);
+  const prompt = [
+    'You summarize tool outputs for an agent context window.',
+    'Preserve facts, file paths, line numbers, errors, commands, URLs, and decisions.',
+    'Do not invent missing information. Do not include hidden analysis.',
+    `Target length: at most ${targetChars} characters.`,
+    instruction ? `Caller instruction: ${instruction}` : ''
+  ].filter(Boolean).join('\n');
+  const query = [
+    `Summarize this ${source} for the calling agent.`,
+    'Return only the summary text.',
+    '',
+    normalized
+  ].join('\n');
+  const result = await runInference(
+    { requestedModel, prompt, query },
+    { ...config, runTimeoutMs: config.toolResultSummarizerTimeoutMs || config.runTimeoutMs },
+    {},
+    session,
+    resolvedModel
+  );
+  const finalText = extractHarmonyFinalText(result.raw) || stripHarmonyControlTokens(result.raw);
+  return clipForModelContext(finalText.trim(), targetChars, 'SpiLLI tool result summary');
+}
+
+function cloneAnthropicBodyWithMessages(body, messages) {
+  return {
+    ...body,
+    messages
+  };
+}
+
+async function summarizeOversizedToolResultsInBody(body, config) {
+  if (!config.compactToolResults || !config.toolResultSummarizerEnabled || !Array.isArray(body?.messages)) {
+    return body;
+  }
+  const threshold = Number.isFinite(config.toolResultCompactChars)
+    ? config.toolResultCompactChars
+    : DEFAULT_TOOL_RESULT_COMPACT_CHARS;
+  const targetChars = Number.isFinite(config.toolResultSummaryTargetChars)
+    ? config.toolResultSummaryTargetChars
+    : DEFAULT_TOOL_RESULT_SUMMARY_TARGET_CHARS;
+  const requestedModel = asString(config.toolResultSummarizerModel || body?.model).trim();
+  if (!requestedModel) {
+    return body;
+  }
+  let changed = false;
+  const messages = [];
+  for (const message of body.messages) {
+    if (!isRecord(message) || !Array.isArray(message.content)) {
+      messages.push(message);
+      continue;
+    }
+    const content = [];
+    for (const part of message.content) {
+      if (!isRecord(part) || (part.type !== 'tool_result' && part.type !== 'web_search_tool_result')) {
+        content.push(part);
+        continue;
+      }
+      const rawText = normalizeContent(part.content, {
+        toolResultRawChars: Number.MAX_SAFE_INTEGER,
+        toolResultCompactChars: Number.MAX_SAFE_INTEGER
+      });
+      if (rawText.length <= threshold) {
+        content.push(part);
+        continue;
+      }
+      const toolUseId = asString(part.tool_use_id) || 'tool';
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'tool_result.summarize.start',
+        summary: {
+          model: requestedModel,
+          toolUseId,
+          originalChars: rawText.length,
+          targetChars
+        }
+      }, 'SUMMARY');
+      try {
+        const summaryText = await summarizeTextWithSpilliSdk({
+          text: rawText,
+          model: requestedModel,
+          config,
+          targetChars,
+          source: part.type
+        });
+        const summarized = buildSummarizedToolResultText({
+          originalText: rawText,
+          summaryText,
+          toolUseId,
+          targetChars
+        });
+        content.push({
+          ...part,
+          content: summarized
+        });
+        changed = true;
+        await appendLog({
+          timestamp: new Date().toISOString(),
+          kind: 'tool_result.summarize.complete',
+          summary: {
+            model: requestedModel,
+            toolUseId,
+            originalChars: rawText.length,
+            summaryChars: summarized.length
+          }
+        }, 'SUMMARY');
+      } catch (error) {
+        content.push(part);
+        await appendLog({
+          timestamp: new Date().toISOString(),
+          kind: 'tool_result.summarize.error',
+          summary: {
+            model: requestedModel,
+            toolUseId,
+            originalChars: rawText.length
+          },
+          error: errorSummary(error)
+        }, 'SUMMARY');
+      }
+    }
+    messages.push({
+      ...message,
+      content
+    });
+  }
+  return changed ? cloneAnthropicBodyWithMessages(body, messages) : body;
+}
+
+function normalizeContentBlock(part, options = {}) {
+  if (typeof part === 'string') {
+    return part;
+  }
+  if (!isRecord(part)) {
+    return '';
+  }
+  if (part.type === 'text') {
+    return asString(part.text);
+  }
+  if (part.type === 'tool_result') {
+    const rawText = normalizeContent(part.content, options);
+    const resultText = options.compactToolResults
+      ? compactToolResultForModelContext(rawText, options)
+      : rawText;
+    const errorText = part.is_error ? '\nTool status: error' : '';
+    return `Tool result for ${asString(part.tool_use_id) || 'tool'}:${errorText}\n${resultText}`.trim();
+  }
+  if (part.type === 'tool_use') {
+    return `Tool call ${asString(part.name)}(${JSON.stringify(part.input ?? {})})`;
+  }
+  if (part.type === 'web_search_tool_result') {
+    const rawText = normalizeContent(part.content, options);
+    const resultText = options.compactToolResults
+      ? compactToolResultForModelContext(rawText, options)
+      : rawText;
+    return `Web search results for ${asString(part.tool_use_id) || 'tool'}:\n${resultText}`.trim();
+  }
+  if (part.type === 'web_search_result' || part.type === 'web_search_result_location') {
+    return normalizeWebSearchResultBlock(part);
+  }
+  if (part.type === 'web_search_tool_result_error') {
+    return `Web search error: ${asString(part.error_code || part.errorCode || 'unknown')}`;
+  }
+  if (part.type === 'image') {
+    return '[Image input omitted by SpiLLI API bridge]';
+  }
+  if (typeof part.text === 'string') {
+    return part.text;
+  }
+  if (typeof part.content === 'string' || Array.isArray(part.content) || isRecord(part.content)) {
+    return normalizeContent(part.content, options);
+  }
+  if (part.title || part.url || part.cited_text || part.snippet) {
+    return normalizeWebSearchResultBlock(part);
+  }
+  return JSON.stringify(sanitizeForLog(part));
+}
+
+function normalizeContent(content, options = {}) {
   if (typeof content === 'string') {
     return content;
+  }
+  if (isRecord(content)) {
+    return normalizeContentBlock(content, options);
   }
   if (!Array.isArray(content)) {
     return '';
   }
   return content
-    .map(part => {
-      if (typeof part === 'string') {
-        return part;
-      }
-      if (!isRecord(part)) {
-        return '';
-      }
-      if (part.type === 'text') {
-        return asString(part.text);
-      }
-      if (part.type === 'tool_result') {
-        return `Tool result for ${asString(part.tool_use_id) || 'tool'}:\n${normalizeContent(part.content)}`;
-      }
-      if (part.type === 'tool_use') {
-        return `Tool call ${asString(part.name)}(${JSON.stringify(part.input ?? {})})`;
-      }
-      if (part.type === 'image') {
-        return '[Image input omitted by SpiLLI API bridge]';
-      }
-      return asString(part.text || part.content);
-    })
+    .map(part => normalizeContentBlock(part, options))
     .filter(Boolean)
     .join('\n');
 }
@@ -1615,44 +2990,113 @@ function normalizeSystem(system) {
   return '';
 }
 
-const NO_TOOLS_PROMPT = [
-  'No external tools are available in this API request.',
-  'Do not emit tool calls, function calls, Harmony recipient calls, or pseudo-tool invocations.',
-  'Do not call Explore, Agent, Read, Write, Edit, Bash, TodoWrite, WebFetch, or any other tool name.',
-  'Answer directly in final text and produce any requested artifact inline.'
-].join(' ');
+function normalizeToolForPrompt(tool) {
+  if (!isRecord(tool)) {
+    return undefined;
+  }
+  const name = asString(tool.name || tool.function?.name).trim();
+  if (!name) {
+    return undefined;
+  }
+  const description = asString(tool.description || tool.function?.description).trim();
+  const inputSchema = tool.input_schema || tool.inputSchema || tool.function?.parameters || tool.function?.input_schema;
+  const normalized = {
+    name,
+    ...(description ? { description } : {}),
+    ...(inputSchema ? { input_schema: inputSchema } : {})
+  };
+  if (Array.isArray(tool.input_examples)) {
+    normalized.input_examples = tool.input_examples;
+  } else if (Array.isArray(tool.inputExamples)) {
+    normalized.input_examples = tool.inputExamples;
+  }
+  return normalized;
+}
 
-function formatToolsForPrompt(tools, { includeSchemas = true } = {}) {
-  if (!Array.isArray(tools) || tools.length === 0) {
-    return NO_TOOLS_PROMPT;
+function sortedToolsForPrompt(tools) {
+  const priority = new Map([
+    ['read', 0],
+    ['edit', 1],
+    ['write', 2],
+    ['bash', 3],
+    ['websearch', 4],
+    ['webfetch', 5],
+    ['agent', 6],
+    ['askuserquestion', 7]
+  ]);
+  return tools
+    .map((tool, index) => ({ tool, index, priority: priority.get(normalizeToolNameForLookup(tool.name)) ?? 100 }))
+    .sort((a, b) => a.priority - b.priority || a.index - b.index)
+    .map(item => item.tool);
+}
+
+function buildToolSchemaPrompt(tools, options = {}) {
+  if (!options.renderToolSchemas || !Array.isArray(tools) || tools.length === 0) {
+    return '';
   }
-  const toolNames = extractAvailableToolNames(tools);
-  const lines = [
-    'Tools are available. When you need a tool, respond with a tool call rather than final prose.',
-    `Use only these exact tool names: ${toolNames.join(', ')}.`,
-    'For broad workspace exploration, use the exact Agent tool with subagent_type "Explore" when Agent is available; otherwise use the available file/search tools directly.',
-    'Do not invent separate Explore or Task tools unless those exact names appear above.',
-    'Tool call JSON shape: {"toolName":"exact_tool_name","callId":"optional-id","args":{...}}',
-    'Available tools:'
-  ];
-  for (const tool of tools) {
-    if (!isRecord(tool)) {
+  const maxChars = Math.max(
+    4000,
+    Math.min(
+      readPositiveInteger(options.toolSchemaPromptMaxChars) ?? DEFAULT_TOOL_SCHEMA_PROMPT_MAX_CHARS,
+      120000
+    )
+  );
+  const header = [
+    'In this environment you have access to a set of tools you can use to answer the user.',
+    'Tool calls must be emitted in the Harmony commentary channel using the exact tool name and a JSON object matching the tool input_schema.',
+    'String and scalar parameters should be specified as JSON string/number/boolean values; arrays and objects should use JSON values.',
+    'For file changes, prefer Edit for partial modifications. Write overwrites files and should be used only for new files or full replacement when the schema description permits it.',
+    '',
+    'Here are the available tools in JSON Schema format:'
+  ].join('\n');
+  const blocks = [header];
+  let omitted = 0;
+  for (const tool of sortedToolsForPrompt(tools.map(normalizeToolForPrompt).filter(Boolean))) {
+    const block = JSON.stringify(tool, null, 2);
+    const next = `${blocks.join('\n\n')}\n\n${block}`;
+    if (next.length > maxChars) {
+      omitted += 1;
       continue;
     }
-    const name = asString(tool.name || tool.function?.name).trim();
-    if (!name) {
-      continue;
-    }
-    const description = asString(tool.description || tool.function?.description).trim();
-    if (!includeSchemas) {
-      const summary = description.replace(/\s+/g, ' ').slice(0, 240);
-      lines.push(`- ${name}: ${summary || 'No description'}`);
-      continue;
-    }
-    const schema = tool.input_schema || tool.parameters || tool.function?.parameters || {};
-    lines.push(`- ${name}: ${description || 'No description'} Schema: ${JSON.stringify(schema)}`);
+    blocks.push(block);
   }
-  return lines.join('\n');
+  if (omitted > 0) {
+    blocks.push(`[${omitted} lower-priority tool definition${omitted === 1 ? '' : 's'} omitted by SpiLLI API bridge to fit the local tool-schema prompt budget.]`);
+  }
+  return blocks.join('\n\n');
+}
+
+function buildAnthropicPromptParts(body, options = {}) {
+  const toolSchemaPrompt = buildToolSchemaPrompt(body?.tools, options);
+  const systemPrompt = normalizeSystem(body?.system);
+  return {
+    prompt: [toolSchemaPrompt, systemPrompt].filter(part => asString(part).trim()).join('\n\n'),
+    toolSchemaPrompt,
+    systemPrompt
+  };
+}
+
+function buildAnthropicPrompt(body, options = {}) {
+  return buildAnthropicPromptParts(body, options).prompt;
+}
+
+function buildPromptFootprint(promptParts, query, options = {}) {
+  const prompt = asString(promptParts?.prompt);
+  const toolSchemaPrompt = asString(promptParts?.toolSchemaPrompt);
+  const systemPrompt = asString(promptParts?.systemPrompt);
+  const queryText = asString(query);
+  return {
+    promptChars: prompt.length,
+    systemChars: systemPrompt.length,
+    toolSchemaChars: toolSchemaPrompt.length,
+    queryChars: queryText.length,
+    totalInputChars: prompt.length + queryText.length,
+    promptUnits: estimateTokens(prompt),
+    queryUnits: estimateTokens(queryText),
+    totalInputUnits: estimateTokens(`${prompt}\n\n${queryText}`),
+    toolCount: Number.isFinite(options.toolCount) ? options.toolCount : undefined,
+    toolSchemaMaxChars: options.toolSchemaPromptMaxChars ?? undefined
+  };
 }
 
 function hashHistoryValue(value) {
@@ -1665,9 +3109,7 @@ function messageText(role, content) {
 }
 
 function createHistoryItem(role, content) {
-  const normalizedRole = ['assistant', 'system'].includes(asString(role).trim().toLowerCase())
-    ? asString(role).trim().toLowerCase()
-    : 'user';
+  const normalizedRole = asString(role || 'user').trim().toLowerCase() || 'user';
   const normalizedContent = asString(content);
   const text = messageText(normalizedRole, normalizedContent);
   return {
@@ -1678,7 +3120,270 @@ function createHistoryItem(role, content) {
   };
 }
 
-function createHistoryState({ requestedModel, prompt, historyItems, allowDelta = true }) {
+function getModelContextLimitTokens(resolvedModel) {
+  const capabilities = resolvedModel?.capabilities;
+  if (!isRecord(capabilities)) {
+    return undefined;
+  }
+  const supportsDynamicContext =
+    capabilities.supports_dynamic_context_budgeting === true ||
+    capabilities.supportsDynamicContextBudgeting === true;
+  if (supportsDynamicContext) {
+    const dynamicDesired =
+      readPositiveNumber(capabilities.dynamicContextDesiredTokens) ??
+      readPositiveNumber(capabilities.dynamic_context_desired_tokens);
+    if (dynamicDesired) {
+      return dynamicDesired;
+    }
+  }
+  return (
+    readPositiveNumber(capabilities.desiredContextTokens) ??
+    readPositiveNumber(capabilities.desired_context_tokens) ??
+    readPositiveNumber(capabilities.pipelineDesiredContextTokens) ??
+    readPositiveNumber(capabilities.pipeline_desired_context_tokens) ??
+    readPositiveNumber(capabilities.pipelineSafeContextTokens) ??
+    readPositiveNumber(capabilities.pipeline_safe_context_tokens) ??
+    readPositiveNumber(capabilities.safeContextTokens) ??
+    readPositiveNumber(capabilities.safe_context_tokens) ??
+    readPositiveNumber(capabilities.contextWindowTokens) ??
+    readPositiveNumber(capabilities.context_window_tokens)
+  );
+}
+
+function getModelMinimumContextTokens(resolvedModel) {
+  const capabilities = resolvedModel?.capabilities;
+  if (!isRecord(capabilities)) {
+    return undefined;
+  }
+  return (
+    readPositiveNumber(capabilities.dynamicContextMinimumTokens) ??
+    readPositiveNumber(capabilities.dynamic_context_minimum_tokens) ??
+    readPositiveNumber(capabilities.minimumContextTokens) ??
+    readPositiveNumber(capabilities.minimum_context_tokens) ??
+    readPositiveNumber(capabilities.pipelineMinimumContextTokens) ??
+    readPositiveNumber(capabilities.pipeline_minimum_context_tokens) ??
+    readPositiveNumber(capabilities.pipelineSafeContextTokens) ??
+    readPositiveNumber(capabilities.pipeline_safe_context_tokens) ??
+    readPositiveNumber(capabilities.safeContextTokens) ??
+    readPositiveNumber(capabilities.safe_context_tokens)
+  );
+}
+
+function deriveHistoryContextPolicy({ prompt, maxTokens, resolvedModel, config }) {
+  if (config?.maxHistoryCharsOverride) {
+    return {
+      source: 'bridge_override',
+      maxHistoryChars: config.maxHistoryCharsOverride,
+      hostContextTokens: getModelContextLimitTokens(resolvedModel),
+      minimumContextTokens: getModelMinimumContextTokens(resolvedModel)
+    };
+  }
+  const hostContextTokens = getModelContextLimitTokens(resolvedModel);
+  const minimumContextTokens = getModelMinimumContextTokens(resolvedModel);
+  if (!hostContextTokens) {
+    return {
+      source: 'unbounded',
+      maxHistoryChars: undefined,
+      hostContextTokens: undefined,
+      minimumContextTokens
+    };
+  }
+  const requestedOutputReserveTokens = Math.max(
+    readPositiveInteger(maxTokens) ?? 0,
+    config?.contextOutputReserveTokens ?? DEFAULT_CONTEXT_OUTPUT_RESERVE_TOKENS
+  );
+  const outputReserveTokens = Math.max(
+    256,
+    Math.min(requestedOutputReserveTokens, Math.floor(hostContextTokens * 0.4))
+  );
+  const promptTokens = estimateTokens(prompt);
+  const inputBudgetTokens = Math.max(
+    1,
+    Math.floor((hostContextTokens - outputReserveTokens - promptTokens) * (config?.contextInputBudgetFraction ?? DEFAULT_CONTEXT_INPUT_BUDGET_FRACTION))
+  );
+  const maxHistoryChars = Math.max(
+    DEFAULT_CONTEXT_MIN_HISTORY_CHARS,
+    Math.floor(inputBudgetTokens * (config?.contextCharsPerToken ?? DEFAULT_CONTEXT_CHARS_PER_TOKEN))
+  );
+  return {
+    source: 'host_capability',
+    maxHistoryChars,
+    hostContextTokens,
+    minimumContextTokens,
+    promptTokens,
+    outputReserveTokens,
+    inputBudgetTokens
+  };
+}
+
+function limitHistoryItemsForModelContext(historyItems, maxHistoryChars) {
+  const items = Array.isArray(historyItems) ? historyItems.filter(item => item?.text) : [];
+  if (!Number.isFinite(maxHistoryChars) || maxHistoryChars <= 0) {
+    return items;
+  }
+  let total = 0;
+  const retained = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    const itemLength = item.text.length + 2;
+    if (retained.length > 0 && total + itemLength > maxHistoryChars) {
+      break;
+    }
+    retained.unshift(item);
+    total += itemLength;
+  }
+  if (retained.length === items.length) {
+    return retained;
+  }
+  const omitted = items.length - retained.length;
+  return [
+    createHistoryItem(
+      'system',
+      `[${omitted} older conversation message${omitted === 1 ? '' : 's'} omitted by SpiLLI API bridge to fit local model context.]`
+    ),
+    ...retained
+  ];
+}
+
+function isClaudeCodeWastedReadText(text) {
+  return /Wasted call\s*[—-]\s*file unchanged since your last Read\.\s*Refer to that earlier tool_result instead\./i.test(
+    asString(text)
+  );
+}
+
+function isToolResultHistoryItem(item) {
+  return /^Tool result for\s+\S+:/i.test(asString(item?.content).trim());
+}
+
+function selectRawDependencyItemsForCompaction(omittedItems, retainedItems, config = {}) {
+  const retainedText = Array.isArray(retainedItems) ? retainedItems.map(item => item?.text || '').join('\n\n') : '';
+  if (!isClaudeCodeWastedReadText(retainedText)) {
+    return [];
+  }
+  const maxDependencyChars = Number.isFinite(config.contextDependencyRawChars)
+    ? config.contextDependencyRawChars
+    : DEFAULT_CONTEXT_DEPENDENCY_RAW_CHARS;
+  for (let index = omittedItems.length - 1; index >= 0; index -= 1) {
+    const item = omittedItems[index];
+    if (!isToolResultHistoryItem(item)) {
+      continue;
+    }
+    if (item.content.length > maxDependencyChars) {
+      return [];
+    }
+    return [
+      createHistoryItem(
+        item.role,
+        [
+          '[raw earlier tool_result retained by SpiLLI API bridge because a later Claude Code Read result references it]',
+          item.content
+        ].join('\n')
+      )
+    ];
+  }
+  return [];
+}
+
+async function compactHistoryItemsForModelContext(historyItems, policy, { requestedModel, config } = {}) {
+  const items = Array.isArray(historyItems) ? historyItems.filter(item => item?.text) : [];
+  const maxHistoryChars = policy?.maxHistoryChars;
+  if (!Number.isFinite(maxHistoryChars) || maxHistoryChars <= 0) {
+    return { items, compacted: false, omitted: 0, summaryChars: 0 };
+  }
+
+  let total = 0;
+  const retained = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    const itemLength = item.text.length + 2;
+    if (retained.length > 0 && total + itemLength > maxHistoryChars) {
+      break;
+    }
+    if (retained.length === 0 && itemLength > maxHistoryChars) {
+      retained.unshift(createHistoryItem(item.role, clipForModelContext(item.content, maxHistoryChars, 'latest history item')));
+      total = retained[0].text.length + 2;
+      break;
+    }
+    retained.unshift(item);
+    total += itemLength;
+  }
+  if (retained.length === items.length) {
+    return { items: retained, compacted: false, omitted: 0, summaryChars: 0 };
+  }
+
+  const omittedItems = items.slice(0, items.length - retained.length);
+  const dependencyItems = selectRawDependencyItemsForCompaction(omittedItems, retained, config);
+  const dependencyHashes = new Set(dependencyItems.map(item => item.hash));
+  const omittedForSummary = dependencyItems.length
+    ? omittedItems.filter(item => !dependencyHashes.has(createHistoryItem(item.role, [
+        '[raw earlier tool_result retained by SpiLLI API bridge because a later Claude Code Read result references it]',
+        item.content
+      ].join('\n')).hash))
+    : omittedItems;
+  const omittedText = omittedForSummary.map(item => item.text).join('\n\n');
+  const summaryTarget = Math.max(
+    800,
+    Math.min(
+      config?.toolResultSummaryTargetChars ?? DEFAULT_TOOL_RESULT_SUMMARY_TARGET_CHARS,
+      Math.floor(maxHistoryChars * 0.25)
+    )
+  );
+  let summaryText = '';
+  let summaryMode = 'deterministic';
+  if (omittedText && config?.toolResultSummarizerEnabled && requestedModel && omittedText.length > summaryTarget * 2) {
+    try {
+      summaryText = await summarizeTextWithSpilliSdk({
+        text: omittedText,
+        model: requestedModel,
+        config,
+        instruction: [
+          'This is older chat history being compacted because SpiLLIHost reported a smaller safe KV context.',
+          'Preserve user requests, assistant commitments, tool results, file paths, errors, and unresolved tasks.',
+          'Do not add new instructions or behavior policy.'
+        ].join(' '),
+        targetChars: summaryTarget,
+        source: 'conversation_history'
+      });
+      summaryMode = 'spilli-sdk';
+    } catch (error) {
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'history.compaction.summarize.error',
+        history: {
+          requestedModel,
+          omittedMessages: omittedItems.length,
+          omittedChars: omittedText.length,
+          targetChars: summaryTarget
+        },
+        error: errorSummary(error)
+      }, 'SUMMARY');
+    }
+  }
+  if (!summaryText.trim() && omittedText) {
+    summaryText = clipForModelContext(omittedText, summaryTarget, 'older conversation history');
+  }
+  const summaryItems = summaryText.trim()
+    ? [
+        createHistoryItem(
+          'system',
+          [
+            `[summarized earlier conversation by SpiLLI API bridge: mode=${summaryMode}; original_messages=${omittedItems.length}; summarized_messages=${omittedForSummary.length}; raw_dependency_messages=${dependencyItems.length}; original_chars=${omittedItems.map(item => item.text).join('\n\n').length}; summarized_chars=${omittedText.length}; host_context_tokens=${policy?.hostContextTokens ?? 'unknown'}]`,
+            summaryText.trim()
+          ].join('\n')
+        )
+      ]
+    : [];
+  return {
+    items: [...summaryItems, ...dependencyItems, ...retained],
+    compacted: true,
+    omitted: omittedItems.length,
+    summaryChars: summaryText.trim().length,
+    summaryMode,
+    rawDependencyCount: dependencyItems.length
+  };
+}
+
+function createHistoryState({ requestedModel, prompt, historyItems, allowDelta = true, maxTokens }) {
   const items = Array.isArray(historyItems) ? historyItems.filter(item => item?.text) : [];
   return {
     requestedModel: asString(requestedModel).trim(),
@@ -1687,6 +3392,7 @@ function createHistoryState({ requestedModel, prompt, historyItems, allowDelta =
     historyItems: items,
     historyHashes: items.map(item => item.hash),
     allowDelta,
+    maxTokens: readPositiveInteger(maxTokens),
     query: items.map(item => item.text).join('\n\n')
   };
 }
@@ -1706,38 +3412,104 @@ function normalizeOpenAiChatMessageContent(message) {
   return parts.filter(Boolean).join('\n');
 }
 
-function buildHistoryStateForAnthropic(body) {
-  // Claude Code already supplies extensive tool guidance in its system prompt.
-  // Keep names and short descriptions for the local model without duplicating
-  // every JSON schema into the model context.
-  const prompt = [
-    normalizeSystem(body.system),
-    formatToolsForPrompt(body.tools, { includeSchemas: false })
-  ].filter(Boolean).join('\n\n');
+function buildHistoryStateForAnthropic(body, options = {}) {
+  const promptParts = buildAnthropicPromptParts(body, {
+    renderToolSchemas: options.renderToolSchemas,
+    toolSchemaPromptMaxChars: options.toolSchemaPromptMaxChars
+  });
+  const prompt = promptParts.prompt;
+  const contentOptions = {
+    compactToolResults: options.compactToolResults,
+    maxToolResultChars: options.maxToolResultChars,
+    toolResultRawChars: options.toolResultRawChars,
+    toolResultCompactChars: options.toolResultCompactChars,
+    toolResultCompactTargetChars: options.toolResultCompactTargetChars,
+    toolResultSummaryTargetChars: options.toolResultSummaryTargetChars,
+    toolResultSummarizerEndpoint: options.toolResultSummarizerEndpoint
+  };
   const historyItems = Array.isArray(body.messages)
     ? body.messages
         .map(message => {
           if (!isRecord(message)) {
             return undefined;
           }
-          return createHistoryItem(asString(message.role) || 'user', normalizeContent(message.content));
+          return createHistoryItem(asString(message.role) || 'user', normalizeContent(message.content, contentOptions));
         })
         .filter(Boolean)
     : [];
-  return createHistoryState({
+  const historyState = createHistoryState({
     requestedModel: body.model,
     prompt,
-    historyItems
+    historyItems: limitHistoryItemsForModelContext(historyItems, options.maxHistoryChars),
+    maxTokens: maxTokensFromAnthropicBody(body)
   });
+  historyState.promptFootprint = buildPromptFootprint(promptParts, historyState.query, {
+    toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+    toolSchemaPromptMaxChars: options.toolSchemaPromptMaxChars
+  });
+  return historyState;
 }
 
-function anthropicToSpilliPayload(body) {
-  const historyState = buildHistoryStateForAnthropic(body);
+async function buildHistoryStateForAnthropicWithContextPolicy(body, config, resolvedModel) {
+  const promptParts = buildAnthropicPromptParts(body, config);
+  const prompt = promptParts.prompt;
+  const contentOptions = {
+    compactToolResults: config.compactToolResults,
+    maxToolResultChars: config.maxToolResultChars,
+    toolResultRawChars: config.toolResultRawChars,
+    toolResultCompactChars: config.toolResultCompactChars,
+    toolResultCompactTargetChars: config.toolResultCompactTargetChars,
+    toolResultSummaryTargetChars: config.toolResultSummaryTargetChars,
+    toolResultSummarizerEndpoint: config.toolResultSummarizerEndpoint
+  };
+  const historyItems = Array.isArray(body.messages)
+    ? body.messages
+        .map(message => {
+          if (!isRecord(message)) {
+            return undefined;
+          }
+          return createHistoryItem(asString(message.role) || 'user', normalizeContent(message.content, contentOptions));
+        })
+        .filter(Boolean)
+    : [];
+  const maxTokens = maxTokensFromAnthropicBody(body);
+  const contextPolicy = deriveHistoryContextPolicy({ prompt, maxTokens, resolvedModel, config });
+  const compacted = await compactHistoryItemsForModelContext(historyItems, contextPolicy, {
+    requestedModel: body.model,
+    config
+  });
+  const historyState = createHistoryState({
+    requestedModel: body.model,
+    prompt,
+    historyItems: compacted.items,
+    maxTokens
+  });
+  historyState.contextPolicy = contextPolicy;
+  historyState.contextCompaction = {
+    compacted: compacted.compacted,
+    omitted: compacted.omitted,
+    summaryChars: compacted.summaryChars,
+    summaryMode: compacted.summaryMode,
+    rawDependencyCount: compacted.rawDependencyCount ?? 0
+  };
+  historyState.promptFootprint = buildPromptFootprint(promptParts, historyState.query, {
+    toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+    toolSchemaPromptMaxChars: config.toolSchemaPromptMaxChars
+  });
+  return historyState;
+}
+
+function historyStateToSpilliPayload(historyState) {
   return {
     requestedModel: historyState.requestedModel,
     prompt: historyState.prompt,
-    query: historyState.query
+    query: historyState.query,
+    ...(historyState.maxTokens ? { max_tokens: historyState.maxTokens } : {})
   };
+}
+
+function anthropicToSpilliPayload(body) {
+  return historyStateToSpilliPayload(buildHistoryStateForAnthropic(body, getConfig()));
 }
 
 function estimateTokens(text) {
@@ -1749,20 +3521,16 @@ function openAiToSpilliPayload(body) {
   return {
     requestedModel: historyState.requestedModel,
     prompt: historyState.prompt,
-    query: historyState.query
+    query: historyState.query,
+    ...(historyState.maxTokens ? { max_tokens: historyState.maxTokens } : {})
   };
 }
 
 function buildHistoryStateForOpenAiChat(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
-  const prompt = [
-    messages
-      .filter(message => isRecord(message) && message.role === 'system')
-      .map(message => normalizeContent(message.content))
-      .filter(Boolean)
-      .join('\n\n'),
-    formatToolsForPrompt(body.tools)
-  ]
+  const prompt = messages
+    .filter(message => isRecord(message) && message.role === 'system')
+    .map(message => normalizeContent(message.content))
     .filter(Boolean)
     .join('\n\n');
   const historyItems = messages
@@ -1771,7 +3539,8 @@ function buildHistoryStateForOpenAiChat(body) {
   return createHistoryState({
     requestedModel: body.model,
     prompt,
-    historyItems
+    historyItems,
+    maxTokens: maxTokensFromOpenAiChatBody(body)
   });
 }
 
@@ -1779,20 +3548,71 @@ function stripEogMarkers(value) {
   return String(value ?? '').replace(/\[EOG\]/g, '');
 }
 
-function extractSpilliHostError(value) {
-  const text = String(value ?? '');
-  const match = text.match(/\|<error>\|([\s\S]*?)\|<\/error>\|/);
-  return match ? match[1].trim() || 'SpiLLIHost returned an unspecified error.' : '';
+function extractSpilliError(raw) {
+  const match = String(raw ?? '').match(/\|<error>\|([\s\S]*?)\|<\/error>\|/);
+  return match ? match[1].trim() : '';
 }
 
-function createSpilliHostRunError(raw) {
-  const message = extractSpilliHostError(raw);
-  if (!message) return undefined;
-  return Object.assign(new Error(message), {
-    statusCode: 502,
-    code: 'SPILLI_HOST_RUN_ERROR',
-    rawHostResponse: String(raw ?? '')
+function isSpilliContextMiss(raw) {
+  return extractSpilliError(raw) === 'SPILLI_CONTEXT_MISS';
+}
+
+function throwIfSpilliError(raw) {
+  const error = extractSpilliError(raw);
+  if (!error) {
+    return;
+  }
+  throw Object.assign(new Error(error), {
+    statusCode: error === 'SPILLI_CONTEXT_MISS' ? 409 : 500,
+    spilliError: error
   });
+}
+
+function isDegenerateSpilliOutput(raw) {
+  const text = stripHarmonyControlTokens(raw).trim();
+  if (!text) {
+    return false;
+  }
+  const questionRuns = text.match(/\?{8,}/g) ?? [];
+  const questionCount = questionRuns.reduce((sum, run) => sum + run.length, 0);
+  if (questionCount >= 16 && questionCount / Math.max(1, text.length) > 0.45) {
+    return true;
+  }
+  return /^[\p{L}\p{N}_.,;:'"()\-\s]{0,40}\?{16,}$/u.test(text);
+}
+
+function throwIfDegenerateSpilliOutput(raw) {
+  if (!isDegenerateSpilliOutput(raw)) {
+    return;
+  }
+  throw Object.assign(new Error('SPILLI_DEGENERATE_OUTPUT'), {
+    statusCode: 500,
+    spilliError: 'SPILLI_DEGENERATE_OUTPUT'
+  });
+}
+
+function isSpilliContextStateError(error) {
+  const message = [
+    error?.spilliError,
+    error instanceof Error ? error.message : String(error ?? ''),
+    isRecord(error?.context) ? JSON.stringify(error.context) : ''
+  ].filter(Boolean).join('\n').toLowerCase();
+  return [
+    'root fragment prompt decode failed',
+    'pipeline fragment failed to mirror upstream kv-cache shift',
+    'failed to mirror upstream kv-cache shift',
+    'kv-cache shift',
+    'spilli_degenerate_output',
+    'sequence positions remain consecutive',
+    'llama_decode: failed to decode',
+    'decode: failed to initialize batch'
+  ].some(marker => message.includes(marker));
+}
+
+function sessionFailureReasonForError(error, fallback = 'bridge_request_failure') {
+  return isSpilliContextStateError(error)
+    ? 'bridge_context_state_failure'
+    : fallback;
 }
 
 function createStreamChunkForwarder(onChunk) {
@@ -1836,47 +3656,16 @@ function createStreamChunkForwarder(onChunk) {
   };
 }
 
-function createMarkerFilteringForwarder(onChunk, marker) {
-  let pending = '';
-  let blocked = false;
-  return {
-    onChunk(chunk) {
-      if (!onChunk || blocked) return;
-      const combined = pending + String(chunk ?? '');
-      if (combined.includes(marker)) {
-        pending = '';
-        blocked = true;
-        return;
-      }
-      // Retain enough leading text to suppress the host's surrounding |<error>| envelope too.
-      const keep = Math.min(marker.length + 32, combined.length);
-      const ready = combined.slice(0, combined.length - keep);
-      pending = combined.slice(combined.length - keep);
-      if (ready) onChunk(ready);
-    },
-    flush() {
-      if (!onChunk || blocked || !pending) return;
-      onChunk(pending);
-      pending = '';
-    }
-  };
-}
-
 function resourceCacheKey(resource) {
-  const graphKey = resource.graph_v2
-    ? [
-        resource.graph_v2.compatibility_id,
-        resource.graph_v2.total_layers,
-        resource.graph_v2.vertex_type ?? '',
-        resource.graph_v2.deadline_unix_ms ?? ''
-      ].join(':')
-    : '';
+  const graph = resource.graph_v2 ?? {};
   return [
     resource.model,
     resource.scope ?? '',
     resource.team ?? '',
     resource.allocation_protocol ?? '',
-    graphKey
+    graph.compatibility_id ?? '',
+    graph.total_layers ?? '',
+    graph.vertex_type ?? ''
   ].join('|');
 }
 
@@ -1885,20 +3674,27 @@ function buildResource(resolvedModel, config) {
   if (config.team) {
     resource.team = config.team;
   }
-  if (resolvedModel.allocationMetadata?.allocationProtocol) {
-    resource.allocation_protocol = resolvedModel.allocationMetadata.allocationProtocol;
-  }
-  if (resolvedModel.allocationMetadata?.graphV2) {
+  const allocationMetadata = isRecord(resolvedModel.allocationMetadata)
+    ? resolvedModel.allocationMetadata
+    : isRecord(resolvedModel.allocation_metadata)
+      ? resolvedModel.allocation_metadata
+      : {};
+  const graphV2 = isRecord(allocationMetadata.graphV2)
+    ? allocationMetadata.graphV2
+    : isRecord(allocationMetadata.graph_v2)
+      ? allocationMetadata.graph_v2
+      : {};
+  const allocationProtocol = Number(allocationMetadata.allocationProtocol ?? allocationMetadata.allocation_protocol ?? 0) || undefined;
+  if (allocationProtocol === 2 || Object.keys(graphV2).length > 0) {
+    resource.allocation_protocol = 2;
     resource.graph_v2 = {
-      compatibility_id: resolvedModel.allocationMetadata.graphV2.compatibilityId,
-      total_layers: resolvedModel.allocationMetadata.graphV2.totalLayers,
-      ...(resolvedModel.allocationMetadata.graphV2.vertexType
-        ? { vertex_type: resolvedModel.allocationMetadata.graphV2.vertexType }
-        : {}),
-      ...(resolvedModel.allocationMetadata.graphV2.deadlineUnixMs
-        ? { deadline_unix_ms: resolvedModel.allocationMetadata.graphV2.deadlineUnixMs }
-        : {})
+      compatibility_id: asString(graphV2.compatibilityId || graphV2.compatibility_id || resolvedModel.uid).trim(),
+      total_layers: Number(graphV2.totalLayers ?? graphV2.total_layers ?? 0) || 0
     };
+    const vertexType = asString(graphV2.vertexType || graphV2.vertex_type).trim();
+    if (vertexType) {
+      resource.graph_v2.vertex_type = vertexType;
+    }
   }
   return resource;
 }
@@ -1918,150 +3714,43 @@ function historyHashesHavePrefix(historyHashes, prefixHashes) {
   return true;
 }
 
-function historyItemToContextMessage(item) {
-  return {
-    role: item.role,
-    content: item.content
-  };
+function historyItemsToContextMessages(historyItems) {
+  return (Array.isArray(historyItems) ? historyItems : [])
+    .map(item => ({
+      role: asString(item?.role || 'user').trim().toLowerCase() || 'user',
+      content: asString(item?.content)
+    }))
+    .filter(item => item.content);
 }
 
-function createSpilliContext(identity, resourceKey, revision, transferMode, recentItems = []) {
-  return {
-    version: 1,
-    window_id: identity.windowId,
-    session_id: identity.sessionId,
-    context_id: identity.contextId,
-    context_revision: revision,
-    transfer_mode: transferMode,
-    resource_key: resourceKey,
-    allow_cross_job_context_reuse: true,
-    delta_messages: transferMode === 'delta' ? [] : undefined,
-    recent_messages: transferMode === 'hydrate'
-      ? recentItems.map(historyItemToContextMessage)
-      : undefined
-  };
-}
-
-function createRunPayloadFromHistory(historyState, queryItems, context, hydrateContext) {
+function createRunPayloadFromHistory(historyState, historyItems, includePrompt) {
   return {
     requestedModel: historyState.requestedModel,
-    prompt: historyState.prompt,
-    query: queryItems.map(item => item.text).join('\n\n'),
-    spilliContext: context,
-    hydrateContext
+    prompt: includePrompt ? historyState.prompt : '',
+    query: historyItems.map(item => item.text).join('\n\n'),
+    ...(historyState.maxTokens ? { max_tokens: historyState.maxTokens } : {})
   };
 }
 
-function summarizeHistoryState(historyState) {
-  return {
-    requestedModel: historyState?.requestedModel ?? null,
-    promptLength: historyState?.prompt?.length ?? 0,
-    promptHash: historyState?.promptHash ?? null,
-    historyItemCount: Array.isArray(historyState?.historyItems) ? historyState.historyItems.length : 0,
-    historyHashCount: Array.isArray(historyState?.historyHashes) ? historyState.historyHashes.length : 0,
-    allowDelta: historyState?.allowDelta === true,
-    queryLength: historyState?.query?.length ?? 0,
-    firstHistoryHash: Array.isArray(historyState?.historyHashes) && historyState.historyHashes.length > 0
-      ? historyState.historyHashes[0]
-      : null,
-    lastHistoryHash: Array.isArray(historyState?.historyHashes) && historyState.historyHashes.length > 0
-      ? historyState.historyHashes[historyState.historyHashes.length - 1]
-      : null
-  };
-}
-
-function summarizeSessionEntry(entry) {
-  if (!entry) {
-    return null;
-  }
-  return {
-    initialized: entry.initialized === true,
-    revision: Number.isInteger(entry.revision) ? entry.revision : null,
-    resourceKey: entry.resourceKey ?? null,
-    promptHash: entry.promptHash ?? null,
-    historyHashCount: Array.isArray(entry.historyHashes) ? entry.historyHashes.length : 0,
-    lastHistoryHash: Array.isArray(entry.historyHashes) && entry.historyHashes.length > 0
-      ? entry.historyHashes[entry.historyHashes.length - 1]
-      : null,
-    sessionLive: entry.session?.isLive?.() === true,
-    identity: entry.identity
-      ? {
-          key: entry.identity.key ?? null,
-          windowId: entry.identity.windowId ?? null,
-          sessionId: entry.identity.sessionId ?? null,
-          contextId: entry.identity.contextId ?? null
-        }
-      : null
-  };
-}
-
-function summarizeContextPayload(context) {
-  if (!context) {
-    return null;
-  }
-  return {
-    version: context.version ?? null,
-    windowId: context.window_id ?? null,
-    sessionId: context.session_id ?? null,
-    contextId: context.context_id ?? null,
-    contextRevision: context.context_revision ?? null,
-    transferMode: context.transfer_mode ?? null,
-    resourceKey: context.resource_key ?? null,
-    recentMessageCount: Array.isArray(context.recent_messages) ? context.recent_messages.length : 0,
-    deltaMessageCount: Array.isArray(context.delta_messages) ? context.delta_messages.length : 0
-  };
-}
-
-function prepareSessionRunPayload(historyState, previousEntry, resourceKey, identity = undefined) {
+function prepareSessionRunPayload(historyState, previousEntry, resourceKey) {
   const previousHashes = previousEntry?.historyHashes ?? [];
-  const canUseDelta =
+  const canReuse =
     previousEntry?.initialized === true &&
     previousEntry?.session?.isLive?.() &&
     previousEntry.promptHash === historyState.promptHash &&
     previousEntry.resourceKey === resourceKey &&
     historyState.allowDelta &&
-    historyState.historyHashes.length > previousHashes.length &&
     historyHashesHavePrefix(historyState.historyHashes, previousHashes);
-  const contextIdentity = identity ?? previousEntry?.identity ?? {
-    windowId: 'api-bridge',
-    sessionId: 'untracked-session',
-    contextId: 'untracked-context'
-  };
-  const revision = Math.max(0, previousEntry?.revision ?? 0) + 1;
-  const queryItems = canUseDelta
+  const historyItems = canReuse
     ? historyState.historyItems.slice(previousHashes.length)
-    : historyState.historyItems.slice(-1);
-  const hydratedItems = historyState.historyItems.slice(0, Math.max(0, historyState.historyItems.length - queryItems.length));
-  const transferMode = canUseDelta ? 'delta' : 'hydrate';
-  const hydrateContext = createSpilliContext(
-    contextIdentity,
-    resourceKey,
-    revision,
-    'hydrate',
-    hydratedItems
-  );
+    : historyState.historyItems;
   return {
-    reused: Boolean(canUseDelta),
-    reason: canUseDelta ? 'append' : previousEntry?.session?.isLive?.() ? 'replace' : 'new',
-    revision,
-    transferMode,
-    payload: createRunPayloadFromHistory(
-      historyState,
-      queryItems,
-      transferMode === 'delta'
-        ? createSpilliContext(contextIdentity, resourceKey, revision, 'delta')
-        : hydrateContext,
-      hydrateContext
-    )
+    reused: Boolean(canReuse),
+    reason: canReuse ? 'append' : previousEntry?.session?.isLive?.() ? 'replace' : 'new',
+    transferMode: canReuse ? 'delta' : 'hydrate',
+    historyItems,
+    payload: createRunPayloadFromHistory(historyState, historyItems, !canReuse)
   };
-}
-
-function shouldReuseTransport(previousEntry, prepared, resourceKey) {
-  return (
-    prepared.transferMode === 'delta' &&
-    previousEntry?.session?.isLive?.() &&
-    previousEntry.resourceKey === resourceKey
-  );
 }
 
 function assistantHistoryItemForAnthropic(message) {
@@ -2072,30 +3761,22 @@ function assistantHistoryItemForOpenAiChat(message) {
   return createHistoryItem('assistant', normalizeOpenAiChatMessageContent(message));
 }
 
-function createResponsesHistoryItem(item) {
-  const text = responsesInputItemToText(item);
-  if (!text) return undefined;
-  const explicitRole = responsesInputItemRole(item);
-  const itemType = isRecord(item) ? asString(item.type) : '';
-  const role = explicitRole === 'assistant' || itemType === 'function_call' || itemType === 'custom_tool_call'
-    ? 'assistant'
-    : 'user';
-  const prefix = `${role.toUpperCase()}:\n`;
-  return createHistoryItem(role, text.startsWith(prefix) ? text.slice(prefix.length) : text);
-}
-
 function assistantHistoryItemsForResponses(output) {
   return Array.isArray(output)
-    ? output.map(createResponsesHistoryItem).filter(Boolean)
+    ? output
+        .map(item => {
+          const text = responsesInputItemToText(item);
+          return text ? { text, hash: hashHistoryValue(text) } : undefined;
+        })
+        .filter(Boolean)
     : [];
 }
 
-async function withResourceRunQueue(resource, callback) {
-  const key = resourceCacheKey(resource);
+async function withResourceKeyRunQueue(key, callback) {
   const previous = state.resourceRunQueues.get(key) ?? Promise.resolve();
   let release;
   const current = previous.catch(() => undefined).then(() => callback());
-  release = current.finally(() => {
+  release = current.catch(() => undefined).finally(() => {
     if (state.resourceRunQueues.get(key) === release) {
       state.resourceRunQueues.delete(key);
     }
@@ -2104,16 +3785,65 @@ async function withResourceRunQueue(resource, callback) {
   return current;
 }
 
+async function withResourceRunQueue(resource, callback) {
+  return withResourceKeyRunQueue(resourceCacheKey(resource), callback);
+}
+
+async function requestSpilliSessionForResource(service, resource, timeoutMs) {
+  const key = resourceCacheKey(resource);
+  await appendLog({
+    timestamp: new Date().toISOString(),
+    kind: 'spilli.allocation.queued',
+    allocation: { resourceKey: key }
+  }, 'ALLOC');
+  return withResourceRunQueue(resource, async () => {
+    const existing = state.resourceSessions.get(key);
+    if (existing?.isLive?.()) {
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'spilli.allocation.reuse',
+        allocation: { resourceKey: key, sessionLive: true }
+      }, 'ALLOC');
+      return existing;
+    }
+    if (existing) {
+      state.resourceSessions.delete(key);
+    }
+    await appendLog({
+      timestamp: new Date().toISOString(),
+      kind: 'spilli.allocation.start',
+      allocation: { resourceKey: key }
+    }, 'ALLOC');
+    try {
+      const session = await service.request(resource, timeoutMs);
+      if (session?.isLive?.()) {
+        state.resourceSessions.set(key, session);
+      }
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'spilli.allocation.complete',
+        allocation: { resourceKey: key, sessionLive: session?.isLive?.() === true }
+      }, 'ALLOC');
+      return session;
+    } catch (error) {
+      state.resourceSessions.delete(key);
+      await appendLog({
+        timestamp: new Date().toISOString(),
+        kind: 'spilli.allocation.error',
+        allocation: { resourceKey: key },
+        error: errorSummary(error)
+      }, 'ALLOC');
+      throw error;
+    }
+  });
+}
+
 // Run inference using an already created SpiLLI session.
-async function runInference(
-  { requestedModel, prompt, query, spilliContext, hydrateContext },
-  config,
-  streamOptions = {},
-  session,
-  resolvedModelOverride
-) {
+async function runInference(payload, config, streamOptions = {}, session, resolvedModelOverride) {
+  const { requestedModel, prompt, query } = payload;
   const resolvedModel = resolvedModelOverride ?? await resolveRequestedModel(requestedModel, config);
   const resource = buildResource(resolvedModel, config);
+  const resourceKey = resourceCacheKey(resource);
   const apiModelName = requestedModel || resolvedModel.displayName;
   return withResourceRunQueue(resource, async () => {
     const activeSession = session?.isLive?.() ? session : undefined;
@@ -2121,135 +3851,350 @@ async function runInference(
       throw Object.assign(new Error('SpiLLI model session is not live.'), { statusCode: 503 });
     }
     streamOptions.onStart?.({ requestedModel: apiModelName, resolvedModel });
-    const runOnce = async (context, suppressContextMiss) => {
-      const attemptSummary = {
+    const runOptions = { timeoutMs: config.runTimeoutMs };
+    const streamForwarder =
+      typeof streamOptions.onChunk === 'function' ? createStreamChunkForwarder(streamOptions.onChunk) : undefined;
+    if (streamForwarder) {
+      runOptions.onChunk = chunk => streamForwarder.onChunk(chunk);
+    }
+  const runPayload = {
+    prompt,
+    query,
+    ...(readPositiveInteger(payload.max_tokens) ? { max_tokens: readPositiveInteger(payload.max_tokens) } : {}),
+    ...(payload.spilliContext ? { spilli_context: payload.spilliContext } : {}),
+    ...(payload.hydrateContext ? { hydrate_context: payload.hydrateContext } : {})
+  };
+    await appendLog({
+      timestamp: new Date().toISOString(),
+      kind: 'spilli.run.start',
+      run: {
         requestedModel: apiModelName,
-        resourceKey: resourceCacheKey(resource),
-        promptLength: prompt.length,
-        queryLength: query.length,
-        context: summarizeContextPayload(context),
-        hydrateContext: summarizeContextPayload(hydrateContext),
-        suppressContextMiss
-      };
-      await appendLog({
-        timestamp: new Date().toISOString(),
-        kind: 'spilli.run.start',
-        run: attemptSummary
-      }, 'RUN');
-      const runOptions = { timeoutMs: config.requestTimeoutMs };
-      const streamForwarder =
-        typeof streamOptions.onChunk === 'function' ? createStreamChunkForwarder(streamOptions.onChunk) : undefined;
-      const hostOutputForwarder = streamForwarder
-        ? createMarkerFilteringForwarder(chunk => streamForwarder.onChunk(chunk), '|<error>|')
-        : undefined;
-      if (streamForwarder) {
-        runOptions.onChunk = chunk => {
-          hostOutputForwarder.onChunk(chunk);
-        };
+        resolvedUid: resolvedModel.uid,
+        resourceKey,
+        timeoutMs: config.runTimeoutMs,
+        maxTokens: runPayload.max_tokens ?? null,
+        promptLength: asString(prompt).length,
+        queryLength: asString(query).length,
+        spilliContext: summarizeContextPayload(payload.spilliContext),
+        hydrateContext: summarizeContextPayload(payload.hydrateContext)
       }
-      let raw;
-      try {
-        raw = stripEogMarkers(await activeSession.run(
-          { prompt, query, spilli_context: context },
-          runOptions
-        ));
-      } catch (error) {
-        await appendLog({
-          timestamp: new Date().toISOString(),
-          kind: 'spilli.run.error',
-          run: attemptSummary,
-          error: errorSummary(error)
-        }, 'RUN');
-        throw error;
-      }
-      hostOutputForwarder?.flush();
+    }, 'RUN');
+    try {
+      const raw = stripEogMarkers(await activeSession.run(runPayload, runOptions));
       streamForwarder?.flush();
+      throwIfSpilliError(raw);
+      throwIfDegenerateSpilliOutput(raw);
       await appendLog({
         timestamp: new Date().toISOString(),
         kind: 'spilli.run.complete',
         run: {
-          ...attemptSummary,
+          requestedModel: apiModelName,
+          resolvedUid: resolvedModel.uid,
+          resourceKey,
           rawLength: raw.length,
-          hasContextMiss: raw.includes('SPILLI_CONTEXT_MISS'),
-          rawPreview: raw.slice(0, 4000)
+          rawPreview: raw.slice(0, 2000),
+          spilliContext: summarizeContextPayload(payload.spilliContext)
         }
       }, 'RUN');
-      return raw;
-    };
-
-    let raw = await runOnce(spilliContext, spilliContext?.transfer_mode === 'delta');
-    if (spilliContext?.transfer_mode === 'delta' && raw.includes('SPILLI_CONTEXT_MISS')) {
-      raw = await runOnce(hydrateContext, false);
-    }
-    const hostError = createSpilliHostRunError(raw);
-    if (hostError) {
+      return {
+        raw,
+        requestedModel: apiModelName,
+        resolvedModel,
+        session: activeSession
+      };
+    } catch (error) {
       await appendLog({
         timestamp: new Date().toISOString(),
-        kind: 'spilli.run.host_error',
+        kind: 'spilli.run.error',
         run: {
           requestedModel: apiModelName,
-          resourceKey: resourceCacheKey(resource),
-          transferMode: spilliContext?.transfer_mode ?? null,
-          error: hostError.message,
-          rawHostResponse: hostError.rawHostResponse
-        }
+          resolvedUid: resolvedModel.uid,
+          resourceKey,
+          spilliContext: summarizeContextPayload(payload.spilliContext)
+        },
+        error: errorSummary(error)
       }, 'RUN');
-      throw hostError;
+      throw error;
     }
-    return {
-      raw,
-      requestedModel: apiModelName,
-      resolvedModel,
-      session: activeSession
-    };
   });
 }
 
-async function getOrCreateClientSession(req, historyState, config) {
+function buildSpilliContextReleaseControl(entry, reason = 'bridge_context_release') {
+  return {
+    version: 1,
+    action: 'release',
+    context_id: entry?.identity?.contextId ?? '',
+    resource_key: entry?.resourceKey ?? '',
+    window_id: entry?.identity?.windowId ?? '',
+    session_id: entry?.identity?.sessionId ?? '',
+    context_revision: entry?.revision ?? 1,
+    reason,
+    lease_kind: entry?.leaseKind === 'ephemeral' ? 'ephemeral' : 'durable',
+    client_kind: entry?.clientKind ?? 'unknown'
+  };
+}
+
+function isSameChatSessionEntry(current, entry) {
+  return (
+    current &&
+    entry &&
+    current.resourceKey === entry.resourceKey &&
+    current.revision === entry.revision &&
+    current.identity?.contextId === entry.identity?.contextId
+  );
+}
+
+async function releaseChatSessionEntry(sessionKey, entry, config, reason = 'bridge_context_release') {
+  if (!sessionKey || !entry) {
+    return false;
+  }
+  const control = buildSpilliContextReleaseControl(entry, reason);
+  const releaseId = crypto.randomUUID();
+  const currentBeforeRelease = state.chatSessions.get(sessionKey);
+  if (isSameChatSessionEntry(currentBeforeRelease, entry)) {
+    state.chatSessions.set(sessionKey, {
+      ...currentBeforeRelease,
+      inFlight: true,
+      releasing: true,
+      releaseId,
+      releaseReason: reason,
+      lastUsedAt: Date.now()
+    });
+  }
+  await appendLog({
+    timestamp: new Date().toISOString(),
+    kind: 'spilli.context.release.start',
+    session: {
+      key: sessionKey,
+      leaseKind: entry.leaseKind ?? 'durable',
+      clientKind: entry.clientKind ?? 'unknown',
+      resourceKey: entry.resourceKey ?? '',
+      contextId: entry.identity?.contextId ?? '',
+      revision: entry.revision ?? 0,
+      releaseId,
+      reason
+    }
+  }, 'SESSION');
+  try {
+    await withResourceKeyRunQueue(entry.resourceKey ?? '', async () => {
+      if (entry.session?.isLive?.()) {
+        if (typeof entry.session.releaseContext === 'function') {
+          await entry.session.releaseContext(control, { timeoutMs: config.allocationTimeoutMs });
+        } else {
+          await entry.session.run({
+            prompt: '',
+            query: '',
+            spilli_context_control: control
+          }, { timeoutMs: config.allocationTimeoutMs });
+        }
+      }
+    });
+    const current = state.chatSessions.get(sessionKey);
+    if (current?.releaseId === releaseId && isSameChatSessionEntry(current, entry)) {
+      state.chatSessions.delete(sessionKey);
+    }
+    await appendLog({
+      timestamp: new Date().toISOString(),
+      kind: 'spilli.context.release.complete',
+      session: {
+        key: sessionKey,
+        leaseKind: entry.leaseKind ?? 'durable',
+        clientKind: entry.clientKind ?? 'unknown',
+        resourceKey: entry.resourceKey ?? '',
+        contextId: entry.identity?.contextId ?? '',
+        revision: entry.revision ?? 0,
+        releaseId,
+        reason
+      }
+    }, 'SESSION');
+    return true;
+  } catch (error) {
+    const current = state.chatSessions.get(sessionKey);
+    if (current?.releaseId === releaseId && isSameChatSessionEntry(current, entry)) {
+      state.chatSessions.set(sessionKey, {
+        ...current,
+        inFlight: false,
+        releasing: false,
+        releaseId: undefined,
+        lastUsedAt: Date.now()
+      });
+    }
+    await appendLog({
+      timestamp: new Date().toISOString(),
+      kind: 'spilli.context.release.error',
+      session: {
+        key: sessionKey,
+        leaseKind: entry.leaseKind ?? 'durable',
+        clientKind: entry.clientKind ?? 'unknown',
+        resourceKey: entry.resourceKey ?? '',
+        contextId: entry.identity?.contextId ?? '',
+        revision: entry.revision ?? 0,
+        releaseId,
+        reason
+      },
+      error: errorSummary(error)
+    }, 'SESSION');
+    return false;
+  }
+}
+
+async function evictIdleDurableContextsForResource(resourceKey, currentSessionKey, config, reason = 'bridge_lru_eviction') {
+  const maxDurable = Math.max(0, Number(config.maxDurableContextsPerResource ?? DEFAULT_MAX_DURABLE_CONTEXTS_PER_RESOURCE));
+  if (maxDurable <= 0) {
+    return 0;
+  }
+  const candidates = Array.from(state.chatSessions.entries())
+    .filter(([key, entry]) => (
+      key !== currentSessionKey &&
+      entry?.resourceKey === resourceKey &&
+      entry?.leaseKind !== 'ephemeral' &&
+      entry?.inFlight !== true
+    ))
+    .sort(([, a], [, b]) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
+  let durableCount = candidates.length;
+  let evicted = 0;
+  while (durableCount >= maxDurable && candidates.length > 0) {
+    const [key, entry] = candidates.shift();
+    if (await releaseChatSessionEntry(key, entry, config, reason)) {
+      evicted += 1;
+      durableCount -= 1;
+    } else {
+      break;
+    }
+  }
+  return evicted;
+}
+
+function markChatSessionIdle(sessionKey, chosenSession) {
+  if (!sessionKey) {
+    return;
+  }
+  const current = state.chatSessions.get(sessionKey);
+  if (current?.session !== chosenSession) {
+    return;
+  }
+  state.chatSessions.set(sessionKey, {
+    ...current,
+    inFlight: false,
+    lastUsedAt: Date.now()
+  });
+}
+
+async function getOrCreateClientSession(req, historyState, config, body = {}) {
   const discoveredIdentity = getSpilliSessionIdentity(req);
-  const identity = discoveredIdentity ?? {
+  const baseIdentity = discoveredIdentity ?? {
     key: `ephemeral:${crypto.randomUUID()}`,
     windowId: 'api-bridge',
     sessionId: crypto.randomUUID(),
     contextId: crypto.randomUUID()
   };
+  const identity = discoveredIdentity
+    ? specializeSessionIdentityForHistory(baseIdentity, historyState)
+    : baseIdentity;
   const sessionKey = identity.key;
   const service = getService(config);
   const resolvedModel = await resolveRequestedModel(historyState.requestedModel, config);
   const resource = buildResource(resolvedModel, config);
   const resourceKey = resourceCacheKey(resource);
-  const previousEntry = discoveredIdentity ? state.chatSessions.get(sessionKey) : undefined;
-  const prepared = prepareSessionRunPayload(historyState, previousEntry, resourceKey, identity);
+  const previousEntry = sessionKey ? state.chatSessions.get(sessionKey) : undefined;
+  const reusablePreviousEntry =
+    previousEntry?.releasing === true || previousEntry?.inFlight === true
+      ? undefined
+      : previousEntry;
+  const prepared = prepareSessionRunPayload(historyState, reusablePreviousEntry, resourceKey);
+  const leaseKind = getLeaseKindForRequest(req, body);
+  const clientKind = getClientKind(req);
+  const nextRevision = (previousEntry?.revision ?? 0) + 1;
+  const transferMode = prepared.transferMode;
+  const contextMessages = historyItemsToContextMessages(prepared.historyItems);
+  const spilliContext = {
+    version: 1,
+    window_id: identity.windowId,
+    session_id: identity.sessionId,
+    context_id: identity.contextId,
+    context_revision: nextRevision,
+    transfer_mode: transferMode,
+    resource_key: resourceKey,
+    lease_kind: leaseKind,
+    client_kind: clientKind,
+    ...(historyState.contextPolicy?.hostContextTokens
+      ? { context_budget_tokens: historyState.contextPolicy.hostContextTokens }
+      : {}),
+    dynamic_context_policy: historyState.contextPolicy ?? undefined,
+    allow_cross_job_context_reuse: true,
+    recent_messages: transferMode === 'hydrate' ? contextMessages : [],
+    delta_messages: transferMode === 'delta' ? contextMessages : []
+  };
+  const retryHydrateContextMessages = historyItemsToContextMessages(historyState.historyItems);
+  const retryHydrateContext = {
+    ...spilliContext,
+    transfer_mode: 'hydrate',
+    recent_messages: retryHydrateContextMessages,
+    delta_messages: []
+  };
+  const retryHydrateRunPayload = createRunPayloadFromHistory(
+    historyState,
+    historyState.historyItems,
+    true
+  );
+  const payload = {
+    ...prepared.payload,
+    spilliContext,
+    hydrateContext: transferMode === 'hydrate' ? spilliContext : undefined,
+    retryHydratePayload: {
+      ...retryHydrateRunPayload,
+      spilliContext: retryHydrateContext,
+      hydrateContext: retryHydrateContext
+    }
+  };
 
-  const canReuseTransport = shouldReuseTransport(previousEntry, prepared, resourceKey);
-  const chosenSession = canReuseTransport
-    ? previousEntry.session
-    : await service.request(resource, config.requestTimeoutMs);
+  if (discoveredIdentity &&
+      previousEntry &&
+      !prepared.reused &&
+      previousEntry.releasing !== true &&
+      previousEntry.inFlight !== true) {
+    await releaseChatSessionEntry(sessionKey, previousEntry, config, 'bridge_context_replaced');
+  }
+
+  if (discoveredIdentity && !prepared.reused && leaseKind === 'durable') {
+    await evictIdleDurableContextsForResource(resourceKey, sessionKey, config, 'bridge_durable_lru_limit');
+  }
+
+  const chosenSession = prepared.reused
+    ? reusablePreviousEntry.session
+    : await requestSpilliSessionForResource(service, resource, config.allocationTimeoutMs);
   if (discoveredIdentity) {
     state.chatSessions.set(sessionKey, {
       session: chosenSession,
       identity,
-      promptHash: previousEntry?.promptHash ?? '',
-      historyHashes: previousEntry?.historyHashes ?? [],
+      promptHash: historyState.promptHash ?? previousEntry?.promptHash ?? '',
+      historyHashes: reusablePreviousEntry?.historyHashes ?? [],
       resourceKey,
-      revision: previousEntry?.revision ?? 0,
-      initialized: canReuseTransport && previousEntry?.initialized === true
+      revision: nextRevision,
+      initialized: prepared.reused && reusablePreviousEntry?.initialized === true,
+      leaseKind,
+      clientKind,
+      lastUsedAt: Date.now(),
+      inFlight: true
     });
   }
 
   const commitHistory = (assistantItems = []) => {
-    if (!discoveredIdentity) {
+    if (!sessionKey) {
       return;
     }
     const current = state.chatSessions.get(sessionKey);
-    if (current?.session !== chosenSession) {
+    if (current?.session !== chosenSession ||
+        current?.revision !== nextRevision ||
+        current?.identity?.contextId !== identity.contextId) {
       return;
     }
     state.chatSessions.set(sessionKey, {
       ...current,
       initialized: true,
-      promptHash: historyState.promptHash,
-      revision: prepared.revision,
+      promptHash: historyState.promptHash ?? current.promptHash ?? '',
+      inFlight: false,
+      lastUsedAt: Date.now(),
       historyHashes: [
         ...historyState.historyHashes,
         ...assistantItems.map(item => item.hash).filter(Boolean)
@@ -2257,18 +4202,125 @@ async function getOrCreateClientSession(req, historyState, config) {
     });
   };
 
+  const finishSession = async (reasonSuffix = 'request_complete') => {
+    const current = state.chatSessions.get(sessionKey);
+    if (!current?.session || current.session !== chosenSession) {
+      return;
+    }
+    const contextStateFailed = String(reasonSuffix).toLowerCase().includes('context_state_failure');
+    if (contextStateFailed ||
+        (current.leaseKind === 'ephemeral' && config.releaseEphemeralContexts)) {
+      const released = await releaseChatSessionEntry(sessionKey, current, config, reasonSuffix);
+      if (!released) {
+        const afterRelease = state.chatSessions.get(sessionKey);
+        if (isSameChatSessionEntry(afterRelease, current)) {
+          state.chatSessions.delete(sessionKey);
+        }
+      }
+      return;
+    }
+    const failed = String(reasonSuffix).toLowerCase().includes('failure');
+    if (failed &&
+        current.revision === nextRevision &&
+        current.identity?.contextId === identity.contextId) {
+      if (previousEntry?.session === chosenSession &&
+          previousEntry?.identity?.contextId === identity.contextId) {
+        state.chatSessions.set(sessionKey, {
+          ...previousEntry,
+          inFlight: false,
+          lastUsedAt: Date.now()
+        });
+      } else {
+        state.chatSessions.delete(sessionKey);
+      }
+      return;
+    }
+    markChatSessionIdle(sessionKey, chosenSession);
+  };
+
   return {
     sessionKey,
     chosenSession,
     resolvedModel,
-    payload: prepared.payload,
-    transferMode: prepared.transferMode,
-    reusedTransport: canReuseTransport,
-    revision: prepared.revision,
+    payload,
+    transferMode,
+    reusedTransport: prepared.reused,
+    revision: nextRevision,
     reason: prepared.reason,
     previousEntry,
     historyState,
-    commitHistory
+    leaseKind,
+    clientKind,
+    commitHistory,
+    finishSession
+  };
+}
+
+function summarizeSessionEntry(entry) {
+  if (!entry) {
+    return null;
+  }
+  return {
+    initialized: entry.initialized === true,
+    revision: entry.revision ?? 0,
+    resourceKey: entry.resourceKey ?? '',
+    leaseKind: entry.leaseKind ?? 'durable',
+    clientKind: entry.clientKind ?? 'unknown',
+    inFlight: entry.inFlight === true,
+    releasing: entry.releasing === true,
+    releaseReason: entry.releaseReason ?? '',
+    lastUsedAt: entry.lastUsedAt ?? null,
+    promptHash: entry.promptHash ?? '',
+    historyHashCount: Array.isArray(entry.historyHashes) ? entry.historyHashes.length : 0,
+    lastHistoryHash: Array.isArray(entry.historyHashes) && entry.historyHashes.length
+      ? entry.historyHashes[entry.historyHashes.length - 1]
+      : null,
+    sessionLive: entry.session?.isLive?.() === true,
+    identity: entry.identity ?? null
+  };
+}
+
+function summarizeHistoryState(historyState) {
+  return {
+    requestedModel: historyState?.requestedModel ?? '',
+    promptLength: asString(historyState?.prompt).length,
+    promptHash: historyState?.promptHash ?? '',
+    historyItemCount: Array.isArray(historyState?.historyItems) ? historyState.historyItems.length : 0,
+    historyHashCount: Array.isArray(historyState?.historyHashes) ? historyState.historyHashes.length : 0,
+    allowDelta: historyState?.allowDelta === true,
+    queryLength: asString(historyState?.query).length,
+    contextPolicy: historyState?.contextPolicy ?? null,
+    contextCompaction: historyState?.contextCompaction ?? null,
+    promptFootprint: historyState?.promptFootprint ?? null,
+    firstHistoryHash: Array.isArray(historyState?.historyHashes) && historyState.historyHashes.length
+      ? historyState.historyHashes[0]
+      : null,
+    lastHistoryHash: Array.isArray(historyState?.historyHashes) && historyState.historyHashes.length
+      ? historyState.historyHashes[historyState.historyHashes.length - 1]
+      : null
+  };
+}
+
+function summarizeContextPayload(context) {
+  if (!context) {
+    return null;
+  }
+  return {
+    version: context.version ?? null,
+    windowId: context.window_id ?? context.windowId ?? '',
+    sessionId: context.session_id ?? context.sessionId ?? '',
+    contextId: context.context_id ?? context.contextId ?? '',
+    contextRevision: context.context_revision ?? context.contextRevision ?? null,
+    transferMode: context.transfer_mode ?? context.transferMode ?? '',
+    resourceKey: context.resource_key ?? context.resourceKey ?? '',
+    leaseKind: context.lease_kind ?? context.leaseKind ?? '',
+    clientKind: context.client_kind ?? context.clientKind ?? '',
+    recentMessageCount: Array.isArray(context.recent_messages)
+      ? context.recent_messages.length
+      : Array.isArray(context.recentMessages) ? context.recentMessages.length : 0,
+    deltaMessageCount: Array.isArray(context.delta_messages)
+      ? context.delta_messages.length
+      : Array.isArray(context.deltaMessages) ? context.deltaMessages.length : 0
   };
 }
 
@@ -2365,7 +4417,6 @@ function getRequestLogPath() {
 
 function summarizeRequestForError(req) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
-  const identity = getSpilliSessionIdentity(req);
   return {
     method: req.method,
     path: url.pathname,
@@ -2378,7 +4429,7 @@ function summarizeRequestForError(req) {
       'x-codex-turn-metadata': sanitizeForLog(req.headers['x-codex-turn-metadata']) ?? null,
       'x-openai-subagent': asString(req.headers['x-openai-subagent']) || null
     },
-    session_key: identity?.key ?? null
+    session_key: getSpilliSessionKey(req) ?? null
   };
 }
 
@@ -2471,6 +4522,76 @@ function summarizeAnthropicMessageShape(message, index) {
   };
 }
 
+function summarizeToolResultPart(part, depth = 0) {
+  if (depth > 5) {
+    return { type: 'max_depth' };
+  }
+  if (typeof part === 'string') {
+    return {
+      type: 'string',
+      length: part.length,
+      preview: part.slice(0, 1200)
+    };
+  }
+  if (Array.isArray(part)) {
+    return {
+      type: 'array',
+      length: part.length,
+      items: part.slice(0, 8).map(item => summarizeToolResultPart(item, depth + 1))
+    };
+  }
+  if (!isRecord(part)) {
+    return {
+      type: typeof part,
+      value: part
+    };
+  }
+  const summary = {
+    type: asString(part.type) || 'object',
+    keys: Object.keys(part).sort()
+  };
+  for (const key of ['tool_use_id', 'name', 'title', 'url', 'page_age', 'error_code']) {
+    if (typeof part[key] === 'string') {
+      summary[key] = part[key].slice(0, 1200);
+    }
+  }
+  for (const key of ['text', 'cited_text', 'snippet']) {
+    if (typeof part[key] === 'string') {
+      summary[`${key}Preview`] = part[key].slice(0, 1200);
+      summary[`${key}Length`] = part[key].length;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(part, 'content')) {
+    summary.content = summarizeToolResultPart(part.content, depth + 1);
+  }
+  return summary;
+}
+
+function summarizeAnthropicToolResults(messages) {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+  const results = [];
+  messages.forEach((message, messageIndex) => {
+    if (!isRecord(message) || !Array.isArray(message.content)) {
+      return;
+    }
+    message.content.forEach((part, partIndex) => {
+      if (!isRecord(part) || part.type !== 'tool_result') {
+        return;
+      }
+      results.push({
+        messageIndex,
+        partIndex,
+        toolUseId: asString(part.tool_use_id) || null,
+        isError: part.is_error === true,
+        content: summarizeToolResultPart(part.content)
+      });
+    });
+  });
+  return results;
+}
+
 function summarizeClaudeRequestHeaders(req) {
   const summary = {};
   for (const [name, value] of Object.entries(req.headers)) {
@@ -2489,6 +4610,8 @@ async function logClaudeRequestShape(req, body, payload) {
     return;
   }
   const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+  const systemPrompt = summarizeSystemPromptForLog(body, payload?.prompt);
+  const toolSchemas = summarizeToolSchemasForLog(body.tools);
   await appendLog(
     {
       timestamp: new Date().toISOString(),
@@ -2501,8 +4624,10 @@ async function logClaudeRequestShape(req, body, payload) {
         stream: body.stream === true,
         max_tokens: Number.isFinite(body.max_tokens) ? body.max_tokens : null,
         systemShape: summarizeAnthropicContentShape(body.system),
+        systemPrompt,
         toolNames: extractAvailableToolNames(body.tools),
         toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+        toolSchemas,
         messages: Array.isArray(body.messages)
           ? body.messages.map((message, index) => summarizeAnthropicMessageShape(message, index))
           : []
@@ -2541,6 +4666,8 @@ async function appendResponseLog(entry) {
 
 async function logInferenceRequest(kind, req, body, payload, extra = {}) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+  const systemPrompt = summarizeSystemPromptForLog(body, payload?.prompt);
+  const toolSchemas = summarizeToolSchemasForLog(body.tools);
   await appendLog({
     timestamp: new Date().toISOString(),
     kind,
@@ -2556,13 +4683,16 @@ async function logInferenceRequest(kind, req, body, payload, extra = {}) {
       model: asString(body.model) || null,
       stream: body.stream === true,
       system: body.system ?? null,
+      systemPrompt,
+      toolSchemas,
       // body: body
       // codexmeta: body.client_metadata["x-codex-turn-metadata"],
       turnmeta:req.headers["x-codex-turn-metadata"],
       subagent: req.headers["x-openai-subagent"],
+      tool_result_summaries: summarizeAnthropicToolResults(body.messages),
       // metadata: body.client_metadata,
       // tools: Array.isArray(body.tools) ? body.tools : [],
-      // tool_names: extractAvailableToolNames(body.tools),
+      tool_names: extractAvailableToolNames(body.tools),
       // messages: Array.isArray(body.messages) ? body.messages : []
     },
     bridge: {
@@ -2576,23 +4706,25 @@ async function logInferenceRequest(kind, req, body, payload, extra = {}) {
   },'REQUEST');
 }
 
-async function logSessionProtocolDecision(kind, req, details) {
+async function logSessionProtocolDecision(kind, req, protocol) {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
   await appendLog({
     timestamp: new Date().toISOString(),
     kind,
     method: req.method,
-    path: new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`).pathname,
-    protocol: details
+    path: url.pathname,
+    protocol
   }, 'PROTOCOL');
 }
 
-async function logSessionState(kind, req, details) {
+async function logSessionState(kind, req, session) {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
   await appendLog({
     timestamp: new Date().toISOString(),
     kind,
     method: req.method,
-    path: new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`).pathname,
-    session: details
+    path: url.pathname,
+    session
   }, 'SESSION');
 }
 
@@ -2622,9 +4754,10 @@ async function logInferenceResponse(kind, data) {
   },'RESPONSE');
 }
 
-function toAnthropicMessage({ id, model, raw, toolsEnabled = false, allowedToolNames = [] }) {
+function toAnthropicMessage({ id, model, raw, toolsEnabled = false, allowedToolNames = [], config = {} }) {
   const toolCalls = toolsEnabled ? parseToolCallsFromOutput(raw, allowedToolNames) : [];
   const text = renderText(raw, toolCalls);
+  const stopReason = extractSpilliStopReason(raw);
   const content = [];
   if (text) {
     content.push({ type: 'text', text });
@@ -2637,13 +4770,28 @@ function toAnthropicMessage({ id, model, raw, toolsEnabled = false, allowedToolN
       input: call.input ?? {}
     });
   }
+  if (shouldAskContinueAfterMaxTokens({ stopReason, toolCalls, allowedToolNames, config })) {
+    content.push({
+      type: 'tool_use',
+      id: createBridgeToolUseId('toolu_spilli_continue'),
+      name: resolveAllowedToolName('AskUserQuestion', allowedToolNames),
+      input: buildContinueAfterMaxTokensQuestion()
+    });
+  }
+  if (content.length === 0 && String(raw ?? '').trim()) {
+    content.push({
+      type: 'text',
+      text: 'I could not convert the model output into a valid Claude Code response. Please retry this step.'
+    });
+  }
+  const hasToolUse = content.some(block => block?.type === 'tool_use');
   return {
     id,
     type: 'message',
     role: 'assistant',
     model,
     content,
-    stop_reason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+    stop_reason: hasToolUse ? 'tool_use' : stopReason || 'end_turn',
     stop_sequence: null,
     usage: {
       input_tokens: 0,
@@ -2669,67 +4817,356 @@ function toRawAnthropicMessage({ id, model, raw }) {
   };
 }
 
+function createAnthropicToolUseMessage({ id, model, name, input }) {
+  return {
+    id,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [
+      {
+        type: 'tool_use',
+        id: `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+        name,
+        input: input ?? {}
+      }
+    ],
+    stop_reason: 'tool_use',
+    stop_sequence: null,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 1
+    }
+  };
+}
+
+function createAnthropicTextMessage({ id, model, text }) {
+  const normalizedText = asString(text);
+  return {
+    id,
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: normalizedText ? [{ type: 'text', text: normalizedText }] : [],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: 0,
+      output_tokens: Math.max(1, Math.ceil(normalizedText.length / 4))
+    }
+  };
+}
+
+function extractClaudeWebSearchHelperQuery(body) {
+  const systemText = normalizeSystem(body?.system).toLowerCase();
+  if (!systemText.includes('web search tool use')) {
+    return '';
+  }
+  const allowedToolNames = extractAvailableToolNames(body?.tools);
+  const hasOnlyWebSearch =
+    allowedToolNames.length === 1 &&
+    ['web_search', 'websearch'].includes(normalizeToolNameForLookup(allowedToolNames[0]));
+  if (!hasOnlyWebSearch || !Array.isArray(body?.messages)) {
+    return '';
+  }
+  const lastUserMessage = [...body.messages].reverse().find(message => isRecord(message) && message.role === 'user');
+  const text = normalizeContent(lastUserMessage?.content).trim();
+  const match = text.match(/perform\s+a\s+web\s+search\s+for\s+the\s+query\s*:\s*([\s\S]+)$/i);
+  return asString(match?.[1]).trim();
+}
+
+function extractSearchResultsFromValue(value) {
+  if (!value) {
+    return [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap(item => extractSearchResultsFromValue(item));
+  }
+  if (typeof value === 'string') {
+    return [];
+  }
+  if (!isRecord(value)) {
+    return [];
+  }
+  const directTitle = asString(value.title || value.heading || value.name).trim();
+  const directUrl = asString(value.url || value.link || value.href || value.firstURL || value.FirstURL).trim();
+  const directSnippet = asString(
+    value.snippet ||
+      value.description ||
+      value.body ||
+      value.abstract ||
+      value.Abstract ||
+      value.text ||
+      value.Text ||
+      value.content
+  ).trim();
+  const direct = directTitle || directUrl || directSnippet
+    ? [{ title: directTitle || directUrl || 'Search result', url: directUrl, snippet: directSnippet }]
+    : [];
+  const nestedKeys = [
+    'results',
+    'items',
+    'organic_results',
+    'organicResults',
+    'webPages',
+    'RelatedTopics',
+    'relatedTopics',
+    'topics'
+  ];
+  const nested = [];
+  for (const key of nestedKeys) {
+    const nestedValue = key === 'webPages' && isRecord(value.webPages) ? value.webPages.value : value[key];
+    nested.push(...extractSearchResultsFromValue(nestedValue));
+  }
+  return [...direct, ...nested];
+}
+
+function dedupeSearchResults(results, maxResults) {
+  const output = [];
+  const seen = new Set();
+  for (const result of results) {
+    const title = asString(result.title).trim();
+    const url = asString(result.url).trim();
+    const snippet = asString(result.snippet).trim();
+    if (!title && !url && !snippet) {
+      continue;
+    }
+    const key = (url || `${title}\n${snippet}`).toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push({ title, url, snippet });
+    if (output.length >= maxResults) {
+      break;
+    }
+  }
+  return output;
+}
+
+function decodeHtmlEntities(value) {
+  return String(value ?? '')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/');
+}
+
+function stripHtml(value) {
+  return decodeHtmlEntities(String(value ?? '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+function parseDuckDuckGoHtmlResults(html, maxResults) {
+  const results = [];
+  const regex = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null && results.length < maxResults) {
+    const href = decodeHtmlEntities(match[1]);
+    let url = href;
+    try {
+      const parsed = new URL(href, 'https://duckduckgo.com');
+      const uddg = parsed.searchParams.get('uddg');
+      url = uddg || parsed.href;
+    } catch {
+      url = href;
+    }
+    results.push({
+      title: stripHtml(match[2]),
+      url,
+      snippet: stripHtml(match[3])
+    });
+  }
+  return results;
+}
+
+function formatWebSearchResults(query, results, provider) {
+  const safeQuery = asString(query).trim();
+  const lines = [`Web search results for query: "${safeQuery}"`];
+  if (!results.length) {
+    lines.push('', `No web search results were returned by ${provider}.`);
+    return lines.join('\n');
+  }
+  results.forEach((result, index) => {
+    const title = result.title || result.url || `Result ${index + 1}`;
+    const url = result.url ? ` (${result.url})` : '';
+    lines.push('', `${index + 1}. ${title}${url}`);
+    if (result.snippet) {
+      lines.push(`   ${result.snippet}`);
+    }
+  });
+  lines.push('', 'Use the result titles and URLs above as markdown hyperlinks when citing sources.');
+  return lines.join('\n');
+}
+
+async function searchWithExternalEndpoint(query, config) {
+  if (!config.webSearchEndpoint) {
+    return undefined;
+  }
+  const endpoint = config.webSearchEndpoint;
+  const body = JSON.stringify({ query, max_results: config.webSearchMaxResults });
+  const response = endpoint.includes('{query}')
+    ? await fetchWithTimeout(endpoint.replaceAll('{query}', encodeURIComponent(query)), {
+        method: 'GET',
+        headers: { accept: 'application/json' }
+      }, config.webSearchTimeoutMs)
+    : await fetchWithTimeout(endpoint, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json'
+        },
+        body
+      }, config.webSearchTimeoutMs);
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`external web search failed (${response.status}): ${text.slice(0, 500)}`);
+  }
+  const parsed = tryParseJson(text);
+  const results = dedupeSearchResults(extractSearchResultsFromValue(parsed ?? text), config.webSearchMaxResults);
+  return {
+    provider: 'external',
+    results,
+    rawText: parsed ? '' : text
+  };
+}
+
+async function searchWithDuckDuckGo(query, config) {
+  const instantUrl = new URL('https://api.duckduckgo.com/');
+  instantUrl.searchParams.set('q', query);
+  instantUrl.searchParams.set('format', 'json');
+  instantUrl.searchParams.set('no_html', '1');
+  instantUrl.searchParams.set('skip_disambig', '1');
+  const instantResponse = await fetchWithTimeout(instantUrl, {
+    headers: { accept: 'application/json' }
+  }, config.webSearchTimeoutMs);
+  const instantText = await instantResponse.text();
+  let results = instantResponse.ok
+    ? dedupeSearchResults(extractSearchResultsFromValue(tryParseJson(instantText)), config.webSearchMaxResults)
+    : [];
+  if (results.length >= Math.min(2, config.webSearchMaxResults)) {
+    return { provider: 'duckduckgo-instant-answer', results };
+  }
+  const htmlUrl = new URL('https://duckduckgo.com/html/');
+  htmlUrl.searchParams.set('q', query);
+  const htmlResponse = await fetchWithTimeout(htmlUrl, {
+    headers: {
+      accept: 'text/html',
+      'user-agent': 'SpiLLI API Bridge/0.1 (+https://synaptrix.org)'
+    }
+  }, config.webSearchTimeoutMs);
+  const html = await htmlResponse.text();
+  if (htmlResponse.ok) {
+    results = dedupeSearchResults([...results, ...parseDuckDuckGoHtmlResults(html, config.webSearchMaxResults)], config.webSearchMaxResults);
+  }
+  return { provider: 'duckduckgo', results };
+}
+
+async function runBridgeWebSearch(query, config) {
+  const errors = [];
+  try {
+    const external = await searchWithExternalEndpoint(query, config);
+    if (external) {
+      return external;
+    }
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+  try {
+    return await searchWithDuckDuckGo(query, config);
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+  return {
+    provider: 'none',
+    results: [],
+    errors
+  };
+}
+
+function maybeBuildClaudeWebSearchHelperMessage(body, id) {
+  const query = extractClaudeWebSearchHelperQuery(body);
+  if (!query) {
+    return undefined;
+  }
+  const allowedName = extractAvailableToolNames(body.tools)[0] || 'web_search';
+  return createAnthropicToolUseMessage({
+    id,
+    model: asString(body.model) || 'spilli',
+    name: allowedName,
+    input: sanitizeToolInput(allowedName, { query })
+  });
+}
+
+async function maybeBuildClaudeWebSearchResultMessage(body, id, config) {
+  const query = extractClaudeWebSearchHelperQuery(body);
+  if (!query) {
+    return undefined;
+  }
+  const search = await runBridgeWebSearch(query, config);
+  const text = formatWebSearchResults(query, search.results, search.provider);
+  return {
+    message: createAnthropicTextMessage({
+      id,
+      model: asString(body.model) || 'spilli',
+      text
+    }),
+    search: {
+      query,
+      provider: search.provider,
+      resultCount: search.results.length,
+      errors: search.errors ?? []
+    }
+  };
+}
+
 function requestHasTools(body) {
   return extractAvailableToolNames(body?.tools).length > 0;
 }
 
-function messageHasOutput(message) {
-  return Array.isArray(message?.content) && message.content.length > 0;
-}
-
-function shouldRetryEmptyAnthropicTurn(message, raw) {
-  if (messageHasOutput(message)) {
-    return false;
-  }
-  const parsed = parseHarmonyOutput(raw);
-  return parsed.isHarmony || Boolean(String(raw || '').trim());
-}
-
-function buildAnthropicRetryPayload(payload, allowedToolNames) {
-  const toolList = allowedToolNames.length ? allowedToolNames.join(', ') : 'none';
-  const repairPrompt = [
-    'Bridge retry instruction: your previous response could not be converted into a valid Anthropic assistant message.',
-    'Do not return analysis-only text.',
-    `Available exact tool names: ${toolList}.`,
-    'If you need workspace search or exploration and Agent is available, emit exactly one tool call in this JSON shape:',
-    '{"toolName":"Agent","args":{"description":"3-5 word task summary","prompt":"specific search/read task with paths and filenames","subagent_type":"Explore"}}',
-    'If no tool is needed, answer directly in the final channel.'
-  ].join('\n');
-  return {
-    ...payload,
-    prompt: repairPrompt,
-    query: ''
-  };
-}
-
 async function runAnthropicInferenceWithRetry(payload, config, options) {
-  let result = await runInference(
-    payload,
-    config,
-    options?.streamOptions ?? {},
-    options?.session,
-    options?.resolvedModel
-  );
+  let retried = false;
+  let result;
+  try {
+    result = await runInference(
+      payload,
+      config,
+      options?.streamOptions ?? {},
+      options?.session,
+      options?.resolvedModel
+    );
+  } catch (error) {
+    if (error?.spilliError !== 'SPILLI_CONTEXT_MISS' || !payload.retryHydratePayload) {
+      throw error;
+    }
+    retried = true;
+    await appendLog({
+      timestamp: new Date().toISOString(),
+      kind: 'spilli.context.retry_hydrate',
+      run: {
+        requestedModel: payload.requestedModel,
+        spilliContext: summarizeContextPayload(payload.spilliContext),
+        hydrateContext: summarizeContextPayload(payload.retryHydratePayload.hydrateContext)
+      }
+    }, 'RUN');
+    result = await runInference(
+      payload.retryHydratePayload,
+      config,
+      options?.streamOptions ?? {},
+      options?.session,
+      options?.resolvedModel
+    );
+  }
   let message = toAnthropicMessage({
     id: options.id,
     model: result.requestedModel,
     raw: result.raw,
     toolsEnabled: options.toolsEnabled,
-    allowedToolNames: options.allowedToolNames
+    allowedToolNames: options.allowedToolNames,
+    config
   });
-  let retried = false;
-  if (shouldRetryEmptyAnthropicTurn(message, result.raw)) {
-    retried = true;
-    const retryPayload = buildAnthropicRetryPayload(payload, options.allowedToolNames);
-    result = await runInference(retryPayload, config, {}, result.session, result.resolvedModel);
-    message = toAnthropicMessage({
-      id: options.id,
-      model: result.requestedModel,
-      raw: result.raw,
-      toolsEnabled: options.toolsEnabled,
-      allowedToolNames: options.allowedToolNames
-    });
-  }
   return { result, message, retried };
 }
 
@@ -2738,11 +5175,94 @@ function writeSse(res, event, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+function writeAnthropicMessageSse(res, message) {
+  writeSse(res, 'message_start', {
+    type: 'message_start',
+    message: {
+      id: message.id,
+      type: 'message',
+      role: 'assistant',
+      model: message.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 0, output_tokens: 0 }
+    }
+  });
+  message.content.forEach((block, index) => {
+    const isToolUse = block.type === 'tool_use';
+    writeSse(res, 'content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: isToolUse
+        ? { type: 'tool_use', id: block.id, name: block.name, input: {} }
+        : { type: 'text', text: '' }
+    });
+    writeSse(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index,
+      delta: isToolUse
+        ? { type: 'input_json_delta', partial_json: JSON.stringify(block.input ?? {}) }
+        : { type: 'text_delta', text: asString(block.text) }
+    });
+    writeSse(res, 'content_block_stop', { type: 'content_block_stop', index });
+  });
+  writeSse(res, 'message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: message.stop_reason, stop_sequence: null },
+    usage: message.usage
+  });
+  writeSse(res, 'message_stop', { type: 'message_stop' });
+}
+
 async function handleAnthropicMessages(req, res, config) {
-  const body = await readBody(req);
-  const historyState = buildHistoryStateForAnthropic(body);
-  const fullPayload = anthropicToSpilliPayload(body);
+  const originalBody = await readBody(req);
+  const body = await summarizeOversizedToolResultsInBody(originalBody, config);
+  const preResolvedModel = await resolveRequestedModel(asString(body.model), config);
+  const historyState = await buildHistoryStateForAnthropicWithContextPolicy(body, config, preResolvedModel);
+  const fullPayload = historyStateToSpilliPayload(historyState);
   await logClaudeRequestShape(req, body, fullPayload);
+  const allowedToolNames = extractAvailableToolNames(body.tools);
+  const toolsEnabled = allowedToolNames.length > 0;
+  const rawMode = config.responseMode === 'raw';
+  const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  const directWebSearch = rawMode ? undefined : await maybeBuildClaudeWebSearchResultMessage(body, id, config);
+  if (directWebSearch) {
+    const directMessage = directWebSearch.message;
+    await logInferenceRequest('anthropic.messages.web_search_helper', req, body, fullPayload, {
+      requestId: id,
+      allowedToolNames,
+      toolsEnabled,
+      responseMode: config.responseMode,
+      effectiveResponseMode: 'compat',
+      bypassedModelRun: true,
+      webSearch: directWebSearch.search
+    });
+    await logInferenceResponse('anthropic.messages.response', {
+      id,
+      stream: body.stream === true,
+      responseMode: config.responseMode,
+      model: directMessage.model,
+      allowedToolNames,
+      emittedContent: directMessage.content,
+      stopReason: directMessage.stop_reason,
+      bypassedModelRun: true,
+      webSearch: directWebSearch.search
+    });
+    if (body.stream === true) {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+        ...corsHeaders()
+      });
+      writeAnthropicMessageSse(res, directMessage);
+      res.end();
+    } else {
+      json(res, 200, directMessage);
+    }
+    return;
+  }
   const {
     chosenSession,
     resolvedModel,
@@ -2751,23 +5271,28 @@ async function handleAnthropicMessages(req, res, config) {
     reusedTransport,
     revision,
     reason,
+    sessionKey,
     previousEntry,
     historyState: preparedHistoryState,
-    commitHistory
-  } = await getOrCreateClientSession(req, historyState, config);
-  const allowedToolNames = extractAvailableToolNames(body.tools);
-  const toolsEnabled = allowedToolNames.length > 0;
-  const rawMode = config.responseMode === 'raw';
-  const id = `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    leaseKind,
+    clientKind,
+    commitHistory,
+    finishSession
+  } = await getOrCreateClientSession(req, historyState, config, body);
   await logInferenceRequest('anthropic.messages', req, body, payload, {
     requestId: id,
     allowedToolNames,
     toolsEnabled,
     responseMode: config.responseMode,
+    effectiveResponseMode: rawMode ? 'raw' : 'compat',
     transferMode,
     reusedTransport,
     revision,
-    reason
+    reason,
+    leaseKind,
+    clientKind,
+    contextPolicy: historyState.contextPolicy ?? null,
+    contextCompaction: historyState.contextCompaction ?? null
   });
   await logSessionProtocolDecision('anthropic.messages.protocol', req, {
     requestId: id,
@@ -2779,7 +5304,9 @@ async function handleAnthropicMessages(req, res, config) {
     queryLength: payload.query.length,
     contextRevision: payload.spilliContext?.context_revision ?? null,
     resourceKey: payload.spilliContext?.resource_key ?? null,
-    sessionKey: getSpilliSessionIdentity(req)?.key ?? null
+    sessionKey,
+    leaseKind,
+    clientKind
   });
   await logSessionState('anthropic.messages.session.before', req, {
     requestId: id,
@@ -2804,6 +5331,8 @@ async function handleAnthropicMessages(req, res, config) {
     let textBlockStopped = false;
     let streamedText = '';
     let outputChars = 0;
+    let completed = false;
+    let finishReason = 'bridge_request_failure';
     const startTextBlock = () => {
       if (textBlockStarted) {
         return;
@@ -2877,18 +5406,7 @@ async function handleAnthropicMessages(req, res, config) {
         ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
         : message;
       commitHistory([assistantHistoryItemForAnthropic(emittedMessage)]);
-      await logSessionState('anthropic.messages.session.after', req, {
-        requestId: id,
-        transferMode,
-        reusedTransport,
-        revision,
-        reason,
-        committedAssistantItems: 1,
-        emittedStopReason: emittedMessage.stop_reason ?? null,
-        emittedContentTypes: Array.isArray(emittedMessage.content)
-          ? emittedMessage.content.map(block => block?.type ?? null)
-          : []
-      });
+      completed = true;
       // await logInferenceResponse('anthropic.messages.response', {
       //   id,
       //   stream: true,
@@ -2938,19 +5456,12 @@ async function handleAnthropicMessages(req, res, config) {
       writeSse(res, 'message_stop', { type: 'message_stop' });
       res.end();
     } catch (err) {
+      finishReason = sessionFailureReasonForError(err, 'bridge_request_failure');
       await logApiError(req, err, {
         route: 'anthropic.messages',
         request_id: id,
         response_mode: config.responseMode,
-        requested_model: payload.requestedModel || null,
-        transfer_mode: transferMode,
-        reused_transport: reusedTransport,
-        revision,
-        reason,
-        previous_entry: summarizeSessionEntry(previousEntry),
-        history_state: summarizeHistoryState(preparedHistoryState),
-        spilli_context: summarizeContextPayload(payload.spilliContext),
-        hydrate_context: summarizeContextPayload(payload.hydrateContext)
+        requested_model: payload.requestedModel || null
       });
       writeSse(res, 'error', {
         type: 'error',
@@ -2959,61 +5470,97 @@ async function handleAnthropicMessages(req, res, config) {
       res.end();
     } finally {
       clearInterval(ping);
+      await finishSession(completed ? 'bridge_request_success' : finishReason);
     }
     return;
   }
-  const { result, message, retried } = rawMode
-    ? {
-        result: await runInference(payload, config, {}, chosenSession, resolvedModel),
-        message: undefined,
-        retried: false
-      }
-    : await runAnthropicInferenceWithRetry(payload, config, {
-        id,
-        toolsEnabled,
-        allowedToolNames,
-        session: chosenSession,
-        resolvedModel
-      });
-  const emittedMessage = rawMode
-    ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
-    : message;
-  commitHistory([assistantHistoryItemForAnthropic(emittedMessage)]);
-  await logSessionState('anthropic.messages.session.after', req, {
-    requestId: id,
-    transferMode,
-    reusedTransport,
-    revision,
-    reason,
-    committedAssistantItems: 1,
-    emittedStopReason: emittedMessage.stop_reason ?? null,
-    emittedContentTypes: Array.isArray(emittedMessage.content)
-      ? emittedMessage.content.map(block => block?.type ?? null)
-      : [],
-    retried
-  });
-  // await logInferenceResponse('anthropic.messages.response', {
-  //   id,
-  //   stream: false,
-  //   retried,
-  //   responseMode: config.responseMode,
-  //   model: result.requestedModel,
-  //   allowedToolNames,
-  //   raw: result.raw,
-  //   harmony: rawMode ? undefined : harmonySummary(result.raw),
-  //   parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
-  //   emittedContent: emittedMessage.content,
-  //   stopReason: emittedMessage.stop_reason
-  // });
-  json(res, 200, emittedMessage);
+  let completed = false;
+  let finishReason = 'bridge_request_failure';
+  try {
+    const { result, message, retried } = rawMode
+      ? {
+          result: await runInference(payload, config, {}, chosenSession, resolvedModel),
+          message: undefined,
+          retried: false
+        }
+      : await runAnthropicInferenceWithRetry(payload, config, {
+          id,
+          toolsEnabled,
+          allowedToolNames,
+          session: chosenSession,
+          resolvedModel
+        });
+    const emittedMessage = rawMode
+      ? toRawAnthropicMessage({ id, model: result.requestedModel, raw: result.raw })
+      : message;
+    commitHistory([assistantHistoryItemForAnthropic(emittedMessage)]);
+    completed = true;
+    // await logInferenceResponse('anthropic.messages.response', {
+    //   id,
+    //   stream: false,
+    //   retried,
+    //   responseMode: config.responseMode,
+    //   model: result.requestedModel,
+    //   allowedToolNames,
+    //   raw: result.raw,
+    //   harmony: rawMode ? undefined : harmonySummary(result.raw),
+    //   parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
+    //   emittedContent: emittedMessage.content,
+    //   stopReason: emittedMessage.stop_reason
+    // });
+    json(res, 200, emittedMessage);
+  } catch (err) {
+    finishReason = sessionFailureReasonForError(err, 'bridge_request_failure');
+    throw err;
+  } finally {
+    await finishSession(completed ? 'bridge_request_success' : finishReason);
+  }
 }
 
 async function handleAnthropicCountTokens(req, res, config) {
   const body = await readBody(req);
-  const payload = anthropicToSpilliPayload(body);
+  const resolvedModel = await resolveRequestedModel(asString(body.model), config);
+  const historyState = await buildHistoryStateForAnthropicWithContextPolicy(body, config, resolvedModel);
+  const payload = historyStateToSpilliPayload(historyState);
   // await logInferenceRequest('anthropic.count_tokens', req, body, payload, { requestId: `tok_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}` });
   json(res, 200, {
     input_tokens: estimateTokens(`${payload.prompt}\n\n${payload.query}`)
+  });
+}
+
+async function handleSummarize(req, res, config) {
+  if (req.method !== 'POST') {
+    json(res, 405, { error: { type: 'invalid_request_error', message: 'Method not allowed.' } });
+    return;
+  }
+  const body = await readBody(req);
+  const text = asString(body.text || body.input || body.content).trim();
+  if (!text) {
+    json(res, 400, { error: { type: 'invalid_request_error', message: 'text is required.' } });
+    return;
+  }
+  const targetChars = readPositiveIntEnv(
+    'SPILLI_BRIDGE_TOOL_RESULT_SUMMARY_TARGET_CHARS',
+    DEFAULT_TOOL_RESULT_SUMMARY_TARGET_CHARS
+  );
+  const requestedTargetChars =
+    Number.parseInt(body.target_chars ?? body.targetChars ?? '', 10);
+  const effectiveTargetChars =
+    Number.isFinite(requestedTargetChars) && requestedTargetChars > 0 ? requestedTargetChars : targetChars;
+  const model = asString(body.model || config.toolResultSummarizerModel || body.requested_model).trim();
+  const summary = await summarizeTextWithSpilliSdk({
+    text,
+    model,
+    config,
+    instruction: asString(body.instruction || body.instructions).trim(),
+    targetChars: effectiveTargetChars,
+    source: asString(body.source || 'summarize_endpoint').trim()
+  });
+  json(res, 200, {
+    summary,
+    original_chars: text.length,
+    summary_chars: summary.length,
+    model: model || config.toolResultSummarizerModel || null
   });
 }
 
@@ -3077,7 +5624,8 @@ async function handleOpenAiChatCompletions(req, res, config) {
     responseMode: config.responseMode
   });
   const created = Math.floor(Date.now() / 1000);
-  const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
+  const { chosenSession, resolvedModel, payload, commitHistory, finishSession } =
+    await getOrCreateClientSession(req, historyState, config, body);
   if (body.stream === true) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -3088,6 +5636,8 @@ async function handleOpenAiChatCompletions(req, res, config) {
     let streamModel = payload.requestedModel;
     let rawForStream = '';
     let streamedText = '';
+    let completed = false;
+    let finishReason = 'bridge_request_failure';
     try {
       const result = await runInference(payload, config, {
         onStart: ({ requestedModel }) => {
@@ -3132,6 +5682,7 @@ async function handleOpenAiChatCompletions(req, res, config) {
         responseMode: config.responseMode
       });
       commitHistory([assistantHistoryItemForOpenAiChat(completion.choices[0]?.message)]);
+      completed = true;
       await logInferenceResponse('openai.chat_completions.response', {
         id,
         stream: true,
@@ -3196,6 +5747,7 @@ async function handleOpenAiChatCompletions(req, res, config) {
       res.write('data: [DONE]\n\n');
       res.end();
     } catch (err) {
+      finishReason = sessionFailureReasonForError(err, 'bridge_request_failure');
       await logApiError(req, err, {
         route: 'openai.chat_completions',
         request_id: id,
@@ -3207,31 +5759,43 @@ async function handleOpenAiChatCompletions(req, res, config) {
       })}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
+    } finally {
+      await finishSession(completed ? 'bridge_request_success' : finishReason);
     }
     return;
   }
-  const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
-  const completion = toOpenAiChatCompletion({
-    id,
-    model: result.requestedModel,
-    raw: result.raw,
-    toolsEnabled,
-    allowedToolNames,
-    responseMode: config.responseMode
-  });
-  commitHistory([assistantHistoryItemForOpenAiChat(completion.choices[0]?.message)]);
-  await logInferenceResponse('openai.chat_completions.response', {
-    id,
-    stream: false,
-    responseMode: config.responseMode,
-    model: result.requestedModel,
-    // allowedToolNames,
-    // raw: result.raw,
-    // harmony: rawMode ? undefined : harmonySummary(result.raw),
-    // parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
-    // emittedChoice: completion.choices[0]
-  });
-  json(res, 200, completion);
+  let completed = false;
+  let finishReason = 'bridge_request_failure';
+  try {
+    const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
+    const completion = toOpenAiChatCompletion({
+      id,
+      model: result.requestedModel,
+      raw: result.raw,
+      toolsEnabled,
+      allowedToolNames,
+      responseMode: config.responseMode
+    });
+    commitHistory([assistantHistoryItemForOpenAiChat(completion.choices[0]?.message)]);
+    completed = true;
+    await logInferenceResponse('openai.chat_completions.response', {
+      id,
+      stream: false,
+      responseMode: config.responseMode,
+      model: result.requestedModel,
+      // allowedToolNames,
+      // raw: result.raw,
+      // harmony: rawMode ? undefined : harmonySummary(result.raw),
+      // parsedToolCalls: rawMode ? [] : parseToolCallsFromOutput(result.raw, allowedToolNames),
+      // emittedChoice: completion.choices[0]
+    });
+    json(res, 200, completion);
+  } catch (err) {
+    finishReason = sessionFailureReasonForError(err, 'bridge_request_failure');
+    throw err;
+  } finally {
+    await finishSession(completed ? 'bridge_request_success' : finishReason);
+  }
 }
 
 async function handleModels(req, res, config) {
@@ -3355,7 +5919,8 @@ function responsesToSpilliPayload(body) {
   return {
     requestedModel: historyState.requestedModel,
     prompt: historyState.prompt,
-    query: historyState.query
+    query: historyState.query,
+    ...(historyState.maxTokens ? { max_tokens: historyState.maxTokens } : {})
   };
 }
 
@@ -3376,8 +5941,7 @@ function buildHistoryStateForResponses(body) {
 
   const prompt = [
     asString(body.instructions).trim(),
-    promptFromInputItems,
-    formatToolsForPrompt(body.tools)
+    promptFromInputItems
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -3387,14 +5951,18 @@ function buildHistoryStateForResponses(body) {
       ? [createHistoryItem('user', input)]
       : inputItems
           .filter((item) => !isInstructionItem(item))
-          .map(createResponsesHistoryItem)
+          .map((item) => {
+            const text = responsesInputItemToText(item);
+            return text ? { text, hash: hashHistoryValue(text) } : undefined;
+          })
           .filter(Boolean);
 
   return createHistoryState({
     requestedModel: body.model,
     prompt,
     historyItems,
-    allowDelta: typeof input !== 'string'
+    allowDelta: typeof input !== 'string',
+    maxTokens: maxTokensFromResponsesBody(body)
   });
 }
 
@@ -3583,6 +6151,9 @@ async function handleOpenAiResponses(req, res, config) {
     let streamModel = fullPayload.requestedModel || asString(body.model).trim() || 'spilli';
     let rawForStream = '';
     let streamedText = '';
+    let finishSession;
+    let requestCompleted = false;
+    let finishReason = 'bridge_request_failure';
 
     let outputItemStarted = false;
     let contentPartStarted = false;
@@ -3640,7 +6211,9 @@ async function handleOpenAiResponses(req, res, config) {
         type: 'response.created',
         response: created
       });
-      const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
+      const sessionRun = await getOrCreateClientSession(req, historyState, config, body);
+      finishSession = sessionRun.finishSession;
+      const { chosenSession, resolvedModel, payload, commitHistory } = sessionRun;
       const result = await runInference(payload, config, {
         onStart: ({ requestedModel }) => {
           streamModel = requestedModel || streamModel;
@@ -3682,6 +6255,7 @@ async function handleOpenAiResponses(req, res, config) {
         responseMode: config.responseMode
       });
       commitHistory(assistantHistoryItemsForResponses(output));
+      requestCompleted = true;
 
       await logInferenceResponse('openai.responses.response', {
         id,
@@ -3771,6 +6345,7 @@ async function handleOpenAiResponses(req, res, config) {
 
       res.end();
     } catch (err) {
+      finishReason = sessionFailureReasonForError(err, 'bridge_request_failure');
       await logApiError(req, err, {
         route: 'openai.responses',
         request_id: id,
@@ -3799,48 +6374,61 @@ async function handleOpenAiResponses(req, res, config) {
       });
 
       res.end();
+    } finally {
+      await finishSession?.(requestCompleted ? 'bridge_request_success' : finishReason);
     }
 
     return;
   }
-  const { chosenSession, resolvedModel, payload, commitHistory } = await getOrCreateClientSession(req, historyState, config);
-  const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
+  const { chosenSession, resolvedModel, payload, commitHistory, finishSession } =
+    await getOrCreateClientSession(req, historyState, config, body);
+  let requestCompleted = false;
+  let finishReason = 'bridge_request_failure';
+  try {
+    const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
 
-  const { output, toolCalls } = toResponsesOutputItems({
-    raw: result.raw,
-    toolsEnabled,
-    allowedToolNames,
-    toolTypes,
-    responseMode: config.responseMode
-  });
-  commitHistory(assistantHistoryItemsForResponses(output));
+    const { output, toolCalls } = toResponsesOutputItems({
+      raw: result.raw,
+      toolsEnabled,
+      allowedToolNames,
+      toolTypes,
+      responseMode: config.responseMode
+    });
+    commitHistory(assistantHistoryItemsForResponses(output));
+    requestCompleted = true;
 
-  await logInferenceResponse('openai.responses.response', {
-    id,
-    stream: false,
-    responseMode: config.responseMode,
-    model: result.requestedModel,
-    // allowedToolNames,
-    // raw: result.raw,
-    // harmony: rawMode ? undefined : harmonySummary(result.raw),
-    parsedToolCalls: toolCalls,
-    // emittedOutput: output
-  });
-
-  json(
-    res,
-    200,
-    createResponsesObject({
+    await logInferenceResponse('openai.responses.response', {
       id,
-      body,
+      stream: false,
+      responseMode: config.responseMode,
       model: result.requestedModel,
-      output,
-      status: 'completed',
-      createdAt,
-      completedAt: Math.floor(Date.now() / 1000),
-      rawText: result.raw
-    })
-  );
+      // allowedToolNames,
+      // raw: result.raw,
+      // harmony: rawMode ? undefined : harmonySummary(result.raw),
+      parsedToolCalls: toolCalls,
+      // emittedOutput: output
+    });
+
+    json(
+      res,
+      200,
+      createResponsesObject({
+        id,
+        body,
+        model: result.requestedModel,
+        output,
+        status: 'completed',
+        createdAt,
+        completedAt: Math.floor(Date.now() / 1000),
+        rawText: result.raw
+      })
+    );
+  } catch (err) {
+    finishReason = sessionFailureReasonForError(err, 'bridge_request_failure');
+    throw err;
+  } finally {
+    await finishSession(requestCompleted ? 'bridge_request_success' : finishReason);
+  }
 }
 
 async function handleScope(req, res, config) {
@@ -3924,6 +6512,10 @@ async function route(req, res) {
     await handleAnthropicCountTokens(req, res, config);
     return;
   }
+  if (req.method === 'POST' && (url.pathname === '/v1/spilli/summarize' || url.pathname === '/summarize')) {
+    await handleSummarize(req, res, config);
+    return;
+  }
   if (
     req.method === 'POST' &&
     (url.pathname === '/v1/responses' || url.pathname === '/responses')
@@ -3943,19 +6535,30 @@ const server = http.createServer((req, res) => {
 });
 
 export {
+  buildResource,
+  buildSpilliContextReleaseControl,
+  buildToolSchemaPrompt,
+  compactHistoryItemsForModelContext,
   buildHistoryStateForAnthropic,
   buildHistoryStateForOpenAiChat,
   buildHistoryStateForResponses,
-  buildResource,
-  createMarkerFilteringForwarder,
   extractHarmonyFinalText,
-  extractSpilliHostError,
+  isDegenerateSpilliOutput,
+  extractSearchResultsFromValue,
+  formatWebSearchResults,
+  getLeaseKindForRequest,
+  limitHistoryItemsForModelContext,
   mergePublicModels,
+  maybeBuildClaudeWebSearchHelperMessage,
   normalizePublicCatalogModels,
   prepareSessionRunPayload,
   parseToolCallsFromOutput,
+  specializeSessionIdentityForHistory,
+  withResourceRunQueue,
   resourceCacheKey,
   renderText,
+  selectPreferredDisplayMatch,
+  toAnthropicMessage,
   toResponsesOutputItems
 };
 
