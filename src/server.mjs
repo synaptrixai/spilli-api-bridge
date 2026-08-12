@@ -69,26 +69,62 @@ function getNamespacedSessionKey(prefix, key) {
 }
 
 function getCodexSessionKey(req) {
+  return getCodexSessionIdentity(req)?.key;
+}
+
+function parseCodexTurnMetadata(req) {
   const metaHeader = req.headers['x-codex-turn-metadata'];
   if (!metaHeader) {
-    return undefined;
+    return {};
   }
 
-  let meta;
   try {
-    meta = typeof metaHeader === 'string' ? JSON.parse(metaHeader) : metaHeader;
+    const parsed = typeof metaHeader === 'string' ? JSON.parse(metaHeader) : metaHeader;
+    return isRecord(parsed) ? parsed : {};
   } catch {
+    return {};
+  }
+}
+
+function requestHeaderString(req, name) {
+  const value = req.headers[name];
+  return asString(Array.isArray(value) ? value[0] : value).trim();
+}
+
+function getCodexSubagentKind(req) {
+  return requestHeaderString(req, 'x-openai-subagent');
+}
+
+function getGenericSessionIdentity(req) {
+  const sessionId = requestHeaderString(req, 'x-spilli-session-id');
+  if (!sessionId) {
+    return undefined;
+  }
+  return {
+    key: getNamespacedSessionKey('spilli', sessionId),
+    windowId: 'api-client',
+    sessionId,
+    contextId: stableBridgeId('spilli-context', sessionId)
+  };
+}
+
+function getCodexSessionIdentity(req) {
+  const meta = parseCodexTurnMetadata(req);
+  const sessionId = requestHeaderString(req, 'session-id') || asString(meta.session_id).trim();
+  const threadId = requestHeaderString(req, 'thread-id') || asString(meta.thread_id).trim() || sessionId;
+  const windowId = asString(meta.window_id).trim() || 'codex';
+
+  if (!sessionId || !threadId) {
     return undefined;
   }
 
-  const windowId = asString(meta?.window_id).trim();
-  const sessionId = asString(meta?.session_id).trim();
-  const threadId = asString(meta?.thread_id).trim();
-  if (!windowId || !sessionId || !threadId) {
-    return undefined;
-  }
-
-  return getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
+  const key = getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
+  return {
+    key,
+    windowId,
+    sessionId,
+    contextId: stableBridgeId('codex-context', threadId)
+  };
 }
 
 function getClaudeSessionKey(req) {
@@ -98,35 +134,6 @@ function getClaudeSessionKey(req) {
 function stableBridgeId(prefix, value) {
   const hash = crypto.createHash('sha256').update(String(value ?? '')).digest('hex').slice(0, 24);
   return `${prefix}-${hash}`;
-}
-
-function getCodexSessionIdentity(req) {
-  const metaHeader = req.headers['x-codex-turn-metadata'];
-  if (!metaHeader) {
-    return undefined;
-  }
-
-  let meta;
-  try {
-    meta = typeof metaHeader === 'string' ? JSON.parse(metaHeader) : metaHeader;
-  } catch {
-    return undefined;
-  }
-
-  const windowId = asString(meta?.window_id).trim();
-  const sessionId = asString(meta?.session_id).trim();
-  const threadId = asString(meta?.thread_id).trim();
-  if (!windowId || !sessionId || !threadId) {
-    return undefined;
-  }
-
-  const key = getNamespacedSessionKey('codex', `${windowId}:${sessionId}:${threadId}`);
-  return {
-    key,
-    windowId,
-    sessionId: `${sessionId}:${threadId}`,
-    contextId: stableBridgeId('codex-context', `${windowId}:${sessionId}:${threadId}`)
-  };
 }
 
 function getClaudeSessionIdentity(req) {
@@ -143,7 +150,7 @@ function getClaudeSessionIdentity(req) {
 }
 
 function getSpilliSessionIdentity(req) {
-  return getCodexSessionIdentity(req) ?? getClaudeSessionIdentity(req);
+  return getCodexSessionIdentity(req) ?? getClaudeSessionIdentity(req) ?? getGenericSessionIdentity(req);
 }
 
 function anthropicSystemText(body) {
@@ -258,6 +265,9 @@ function getClientKind(req) {
   if (getCodexSessionIdentity(req)) {
     return 'codex';
   }
+  if (getGenericSessionIdentity(req)) {
+    return 'api';
+  }
   return 'unknown';
 }
 
@@ -290,13 +300,30 @@ function isClaudeUtilityRequest(req, body = {}) {
 }
 
 function getLeaseKindForRequest(req, body = {}) {
-  return isClaudeSubagentRequest(req, body) || isClaudeUtilityRequest(req, body)
+  return isClaudeSubagentRequest(req, body) || isClaudeUtilityRequest(req, body) || Boolean(getCodexSubagentKind(req))
     ? 'ephemeral'
     : 'durable';
 }
 
-function specializeSessionIdentityForHistory(identity, historyState) {
-  if (!identity || !String(identity.key ?? '').startsWith('claude:')) {
+function specializeSessionIdentityForHistory(identity, historyState, req = { headers: {} }) {
+  if (!identity) {
+    return identity;
+  }
+  if (String(identity.key ?? '').startsWith('codex:')) {
+    const subagentKind = getCodexSubagentKind(req);
+    if (!subagentKind) {
+      return identity;
+    }
+    const turnId = asString(parseCodexTurnMetadata(req).turn_id).trim();
+    const subagentScopeValue = turnId ? `${subagentKind}:${turnId}` : subagentKind;
+    const subagentScope = stableBridgeId('subagent', subagentScopeValue);
+    return {
+      ...identity,
+      key: `${identity.key}:${subagentScope}`,
+      contextId: stableBridgeId('codex-context', `${identity.contextId}:${subagentScopeValue}`)
+    };
+  }
+  if (!String(identity.key ?? '').startsWith('claude:')) {
     return identity;
   }
   const promptHash = asString(historyState?.promptHash).trim();
@@ -321,7 +348,7 @@ function specializeSessionIdentityForHistory(identity, historyState) {
  * @returns {string|undefined} Session key when present
  */
 function getSpilliSessionKey(req) {
-  return getCodexSessionKey(req) ?? getClaudeSessionKey(req);
+  return getCodexSessionKey(req) ?? getClaudeSessionKey(req) ?? getGenericSessionIdentity(req)?.key;
 }
 
 
@@ -3383,7 +3410,7 @@ async function compactHistoryItemsForModelContext(historyItems, policy, { reques
   };
 }
 
-function createHistoryState({ requestedModel, prompt, historyItems, allowDelta = true, maxTokens }) {
+function createHistoryState({ requestedModel, prompt, historyItems, allowDelta = true, maxTokens, currentItemCount = 1 }) {
   const items = Array.isArray(historyItems) ? historyItems.filter(item => item?.text) : [];
   return {
     requestedModel: asString(requestedModel).trim(),
@@ -3392,9 +3419,40 @@ function createHistoryState({ requestedModel, prompt, historyItems, allowDelta =
     historyItems: items,
     historyHashes: items.map(item => item.hash),
     allowDelta,
+    currentItemCount: Math.min(items.length, Math.max(0, Math.trunc(currentItemCount))),
     maxTokens: readPositiveInteger(maxTokens),
     query: items.map(item => item.text).join('\n\n')
   };
+}
+
+async function applyContextPolicyToHistoryState(historyState, config, resolvedModel) {
+  const contextPolicy = deriveHistoryContextPolicy({
+    prompt: historyState.prompt,
+    maxTokens: historyState.maxTokens,
+    resolvedModel,
+    config
+  });
+  const compacted = await compactHistoryItemsForModelContext(historyState.historyItems, contextPolicy, {
+    requestedModel: historyState.requestedModel,
+    config
+  });
+  const compactedState = createHistoryState({
+    requestedModel: historyState.requestedModel,
+    prompt: historyState.prompt,
+    historyItems: compacted.items,
+    allowDelta: historyState.allowDelta,
+    maxTokens: historyState.maxTokens,
+    currentItemCount: historyState.currentItemCount
+  });
+  compactedState.contextPolicy = contextPolicy;
+  compactedState.contextCompaction = {
+    compacted: compacted.compacted,
+    omitted: compacted.omitted,
+    summaryChars: compacted.summaryChars,
+    summaryMode: compacted.summaryMode,
+    rawDependencyCount: compacted.rawDependencyCount ?? 0
+  };
+  return compactedState;
 }
 
 function normalizeOpenAiChatMessageContent(message) {
@@ -3542,6 +3600,10 @@ function buildHistoryStateForOpenAiChat(body) {
     historyItems,
     maxTokens: maxTokensFromOpenAiChatBody(body)
   });
+}
+
+async function buildHistoryStateForOpenAiChatWithContextPolicy(body, config, resolvedModel) {
+  return applyContextPolicyToHistoryState(buildHistoryStateForOpenAiChat(body), config, resolvedModel);
 }
 
 function stripEogMarkers(value) {
@@ -3723,10 +3785,10 @@ function historyItemsToContextMessages(historyItems) {
     .filter(item => item.content);
 }
 
-function createRunPayloadFromHistory(historyState, historyItems, includePrompt) {
+function createRunPayloadFromHistory(historyState, historyItems) {
   return {
     requestedModel: historyState.requestedModel,
-    prompt: includePrompt ? historyState.prompt : '',
+    prompt: historyState.prompt,
     query: historyItems.map(item => item.text).join('\n\n'),
     ...(historyState.maxTokens ? { max_tokens: historyState.maxTokens } : {})
   };
@@ -3741,15 +3803,24 @@ function prepareSessionRunPayload(historyState, previousEntry, resourceKey) {
     previousEntry.resourceKey === resourceKey &&
     historyState.allowDelta &&
     historyHashesHavePrefix(historyState.historyHashes, previousHashes);
-  const historyItems = canReuse
+  const deltaItems = canReuse
     ? historyState.historyItems.slice(previousHashes.length)
-    : historyState.historyItems;
+    : [];
+  const currentItemCount = canReuse
+    ? deltaItems.length
+    : Math.min(historyState.historyItems.length, Math.max(0, historyState.currentItemCount ?? 1));
+  const queryItems = canReuse
+    ? deltaItems
+    : historyState.historyItems.slice(historyState.historyItems.length - currentItemCount);
+  const hydrationItems = historyState.historyItems.slice(0, historyState.historyItems.length - queryItems.length);
   return {
     reused: Boolean(canReuse),
     reason: canReuse ? 'append' : previousEntry?.session?.isLive?.() ? 'replace' : 'new',
     transferMode: canReuse ? 'delta' : 'hydrate',
-    historyItems,
-    payload: createRunPayloadFromHistory(historyState, historyItems, !canReuse)
+    historyItems: queryItems,
+    queryItems,
+    hydrationItems,
+    payload: createRunPayloadFromHistory(historyState, queryItems)
   };
 }
 
@@ -4089,7 +4160,7 @@ async function getOrCreateClientSession(req, historyState, config, body = {}) {
     contextId: crypto.randomUUID()
   };
   const identity = discoveredIdentity
-    ? specializeSessionIdentityForHistory(baseIdentity, historyState)
+    ? specializeSessionIdentityForHistory(baseIdentity, historyState, req)
     : baseIdentity;
   const sessionKey = identity.key;
   const service = getService(config);
@@ -4106,7 +4177,7 @@ async function getOrCreateClientSession(req, historyState, config, body = {}) {
   const clientKind = getClientKind(req);
   const nextRevision = (previousEntry?.revision ?? 0) + 1;
   const transferMode = prepared.transferMode;
-  const contextMessages = historyItemsToContextMessages(prepared.historyItems);
+  const hydrationContextMessages = historyItemsToContextMessages(prepared.hydrationItems);
   const spilliContext = {
     version: 1,
     window_id: identity.windowId,
@@ -4122,21 +4193,17 @@ async function getOrCreateClientSession(req, historyState, config, body = {}) {
       : {}),
     dynamic_context_policy: historyState.contextPolicy ?? undefined,
     allow_cross_job_context_reuse: true,
-    recent_messages: transferMode === 'hydrate' ? contextMessages : [],
-    delta_messages: transferMode === 'delta' ? contextMessages : []
+    recent_messages: transferMode === 'hydrate' ? hydrationContextMessages : [],
+    delta_messages: []
   };
-  const retryHydrateContextMessages = historyItemsToContextMessages(historyState.historyItems);
+  const retryHydrateContextMessages = historyItemsToContextMessages(prepared.hydrationItems);
   const retryHydrateContext = {
     ...spilliContext,
     transfer_mode: 'hydrate',
     recent_messages: retryHydrateContextMessages,
     delta_messages: []
   };
-  const retryHydrateRunPayload = createRunPayloadFromHistory(
-    historyState,
-    historyState.historyItems,
-    true
-  );
+  const retryHydrateRunPayload = createRunPayloadFromHistory(historyState, prepared.queryItems);
   const payload = {
     ...prepared.payload,
     spilliContext,
@@ -5611,8 +5678,9 @@ function toOpenAiChatCompletion({
 
 async function handleOpenAiChatCompletions(req, res, config) {
   const body = await readBody(req);
-  const historyState = buildHistoryStateForOpenAiChat(body);
-  const fullPayload = openAiToSpilliPayload(body);
+  const preResolvedModel = await resolveRequestedModel(asString(body.model), config);
+  const historyState = await buildHistoryStateForOpenAiChatWithContextPolicy(body, config, preResolvedModel);
+  const fullPayload = historyStateToSpilliPayload(historyState);
   const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
   const allowedToolNames = extractAvailableToolNames(body.tools);
   const toolsEnabled = allowedToolNames.length > 0;
@@ -5914,6 +5982,18 @@ function responsesInputItemToText(item) {
   return `${role}:\n${responsesContentToText(item.content)}`;
 }
 
+function responsesInputItemToHistoryItem(item) {
+  const text = responsesInputItemToText(item);
+  if (!text) {
+    return undefined;
+  }
+  const explicitRole = responsesInputItemRole(item);
+  const itemType = asString(item?.type).toLowerCase();
+  const role = explicitRole || (itemType.includes('call') && !itemType.endsWith('_output') ? 'assistant' : 'user');
+  const content = explicitRole && isRecord(item) ? responsesContentToText(item.content) : text;
+  return { role, content, text, hash: hashHistoryValue(text) };
+}
+
 function responsesToSpilliPayload(body) {
   const historyState = buildHistoryStateForResponses(body);
   return {
@@ -5951,10 +6031,7 @@ function buildHistoryStateForResponses(body) {
       ? [createHistoryItem('user', input)]
       : inputItems
           .filter((item) => !isInstructionItem(item))
-          .map((item) => {
-            const text = responsesInputItemToText(item);
-            return text ? { text, hash: hashHistoryValue(text) } : undefined;
-          })
+          .map(responsesInputItemToHistoryItem)
           .filter(Boolean);
 
   return createHistoryState({
@@ -5964,6 +6041,10 @@ function buildHistoryStateForResponses(body) {
     allowDelta: typeof input !== 'string',
     maxTokens: maxTokensFromResponsesBody(body)
   });
+}
+
+async function buildHistoryStateForResponsesWithContextPolicy(body, config, resolvedModel) {
+  return applyContextPolicyToHistoryState(buildHistoryStateForResponses(body), config, resolvedModel);
 }
 
 function createResponseId(prefix = 'resp') {
@@ -6122,8 +6203,9 @@ function writeResponsesSse(res, event) {
 
 async function handleOpenAiResponses(req, res, config) {
   const body = await readBody(req);
-  const historyState = buildHistoryStateForResponses(body);
-  const fullPayload = responsesToSpilliPayload(body);
+  const preResolvedModel = await resolveRequestedModel(asString(body.model), config);
+  const historyState = await buildHistoryStateForResponsesWithContextPolicy(body, config, preResolvedModel);
+  const fullPayload = historyStateToSpilliPayload(historyState);
   const id = createResponseId('resp');
   const createdAt = Math.floor(Date.now() / 1000);
   const messageId = createResponseId('msg');
@@ -6546,6 +6628,8 @@ export {
   isDegenerateSpilliOutput,
   extractSearchResultsFromValue,
   formatWebSearchResults,
+  getCodexSessionIdentity,
+  getGenericSessionIdentity,
   getLeaseKindForRequest,
   limitHistoryItemsForModelContext,
   mergePublicModels,

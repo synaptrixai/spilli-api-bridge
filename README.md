@@ -165,7 +165,7 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_BRIDGE_CONTEXT_CHARS_PER_TOKEN`: conservative text-to-token conversion used when deriving a bridge history budget from host-reported token limits, default `3`.
 - `SPILLI_BRIDGE_CONTEXT_INPUT_BUDGET_FRACTION`: fraction of remaining host context assigned to input history after prompt/output reserve, default `0.72`.
 - `SPILLI_BRIDGE_CONTEXT_OUTPUT_RESERVE_TOKENS`: minimum output-token reserve used when deriving bridge history budget from host limits, default `1024`.
-- `SPILLI_BRIDGE_RELEASE_EPHEMERAL_CONTEXTS`: release short-lived Claude Code subagent KV contexts after success or failure, default `1`.
+- `SPILLI_BRIDGE_RELEASE_EPHEMERAL_CONTEXTS`: release short-lived Claude Code and Codex subagent/utility KV contexts after success or failure, default `1`.
 - `SPILLI_BRIDGE_MAX_DURABLE_CONTEXTS_PER_RESOURCE`: maximum idle durable main-session contexts to keep warm per SpiLLI resource before LRU release, default `2`.
 - `SPILLI_BRIDGE_MODEL_ALIASES`: optional model aliases in `client_name=spilli_name` form, separated by commas or semicolons. No aliases are built in; model names pass through unchanged unless this variable is set.
 - `SPILLI_BRIDGE_RESPONSE_MODE`: response conversion mode, default `compat`.
@@ -254,12 +254,14 @@ Anthropic-compatible `/v1/messages`, OpenAI-compatible `/v1/chat/completions`, a
 
 The bridge maps client conversation metadata to SpiLLIHost's versioned `spilli_context` protocol:
 
-- Codex uses `window_id`, `session_id`, and `thread_id` from `x-codex-turn-metadata`.
+- Current Codex clients use `session-id` and `thread-id`; legacy clients may supply `window_id`, `session_id`, and `thread_id` in `x-codex-turn-metadata`.
 - Claude Code uses `x-claude-code-session-id`.
 - Other clients may send `x-spilli-session-id` to opt into stateful reuse.
 - Requests without a supported session identifier are isolated and hydrated as one-off conversations.
 
-The first turn, rewritten history, model changes, and reconnects use `hydrate`. Strict append-only follow-ups use `delta` and send only the uncommitted suffix as the current query. If SpiLLIHost reports `SPILLI_CONTEXT_MISS`, the bridge suppresses that internal marker and retries the same revision once with hydration.
+The first turn, rewritten history, model changes, and reconnects use `hydrate`. Hydration places prior committed messages in `recent_messages` and the current input only in `query`. Strict append-only follow-ups use `delta`, leave both context message arrays empty, and send only the uncommitted suffix as `query`. If SpiLLIHost reports `SPILLI_CONTEXT_MISS`, the bridge suppresses that internal marker and retries the same revision once with a fresh prior-message snapshot and the same query.
+
+Codex requests carrying `x-openai-subagent` are isolated from their parent context and use ephemeral host leases. A subagent may reuse the same SDK allocation as its parent, but it never shares the parent's logical `context_id` or revision cursor.
 
 Model selection follows the extension's current allocation rule:
 

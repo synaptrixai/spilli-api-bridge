@@ -14,6 +14,8 @@ import {
   extractHarmonyFinalText,
   extractSearchResultsFromValue,
   formatWebSearchResults,
+  getCodexSessionIdentity,
+  getGenericSessionIdentity,
   getLeaseKindForRequest,
   isDegenerateSpilliOutput,
   limitHistoryItemsForModelContext,
@@ -865,6 +867,7 @@ assert.equal(firstPrepared.reused, false, 'first request creates a full-history 
 assert.equal(firstAnthropicHistory.prompt, 'Be concise.', 'Anthropic prompt only contains caller-provided system text');
 assert.equal(firstPrepared.payload.prompt, firstAnthropicHistory.prompt);
 assert.equal(firstPrepared.payload.query, 'USER:\nHello');
+assert.deepEqual(firstPrepared.hydrationItems, [], 'the current first-turn query is not duplicated in hydration history');
 
 const anthropicHistoryWithTools = buildHistoryStateForAnthropic({
   model: 'spilli-test',
@@ -896,12 +899,20 @@ const previousAfterAssistant = {
 };
 const secondPrepared = prepareSessionRunPayload(secondAnthropicHistory, previousAfterAssistant, resourceKey);
 assert.equal(secondPrepared.reused, true, 'append-only request reuses the live session');
-assert.equal(secondPrepared.payload.prompt, '', 'append-only request does not resend the prompt');
+assert.equal(secondPrepared.payload.prompt, 'Be concise.', 'the system prompt remains available while chat history is delta-transferred');
 assert.equal(
   secondPrepared.payload.query,
   'USER:\nNext question',
   'append-only request sends only the new user suffix'
 );
+assert.equal(secondPrepared.hydrationItems.length, 2, 'delta preparation retains prior messages for context-miss hydration retry');
+
+const rewrittenPrepared = prepareSessionRunPayload(secondAnthropicHistory, undefined, resourceKey);
+assert.equal(rewrittenPrepared.transferMode, 'hydrate');
+assert.equal(rewrittenPrepared.payload.query, 'USER:\nNext question');
+assert.equal(rewrittenPrepared.hydrationItems.length, 2, 'fresh hydration contains prior messages only');
+assert.equal(rewrittenPrepared.hydrationItems[0].content, 'Hello');
+assert.equal(rewrittenPrepared.hydrationItems[1].content, 'Hi there');
 
 const claudeBaseIdentity = {
   key: 'claude:shared-session',
@@ -981,6 +992,67 @@ assert.equal(
   'non-Claude clients keep their explicit context identity'
 );
 
+const modernCodexRequest = {
+  headers: {
+    'session-id': 'session-modern',
+    'thread-id': 'thread-modern'
+  }
+};
+const modernCodexIdentity = getCodexSessionIdentity(modernCodexRequest);
+assert.equal(modernCodexIdentity.windowId, 'codex');
+assert.equal(modernCodexIdentity.sessionId, 'session-modern');
+assert.match(modernCodexIdentity.key, /^codex:/);
+assert.match(modernCodexIdentity.contextId, /^codex-context-/);
+
+const legacyCodexIdentity = getCodexSessionIdentity({
+  headers: {
+    'x-codex-turn-metadata': JSON.stringify({
+      window_id: 'window-legacy',
+      session_id: 'session-legacy',
+      thread_id: 'thread-legacy'
+    })
+  }
+});
+assert.equal(legacyCodexIdentity.windowId, 'window-legacy');
+assert.equal(legacyCodexIdentity.sessionId, 'session-legacy');
+
+const codexSubagentRequest = {
+  headers: {
+    'session-id': 'session-modern',
+    'thread-id': 'thread-modern',
+    'x-openai-subagent': 'compact',
+    'x-codex-turn-metadata': JSON.stringify({ turn_id: 'child-turn-1' })
+  }
+};
+const codexSubagentIdentity = specializeSessionIdentityForHistory(
+  getCodexSessionIdentity(codexSubagentRequest),
+  secondAnthropicHistory,
+  codexSubagentRequest
+);
+assert.notEqual(codexSubagentIdentity.key, modernCodexIdentity.key, 'Codex subagents use isolated bridge session keys');
+assert.notEqual(codexSubagentIdentity.contextId, modernCodexIdentity.contextId, 'Codex subagents use isolated host contexts');
+assert.equal(getLeaseKindForRequest(codexSubagentRequest), 'ephemeral', 'Codex subagent contexts use ephemeral leases');
+const concurrentCodexSubagentRequest = {
+  headers: {
+    ...codexSubagentRequest.headers,
+    'x-codex-turn-metadata': JSON.stringify({ turn_id: 'child-turn-2' })
+  }
+};
+const concurrentCodexSubagentIdentity = specializeSessionIdentityForHistory(
+  getCodexSessionIdentity(concurrentCodexSubagentRequest),
+  secondAnthropicHistory,
+  concurrentCodexSubagentRequest
+);
+assert.notEqual(
+  concurrentCodexSubagentIdentity.contextId,
+  codexSubagentIdentity.contextId,
+  'concurrent Codex subagent turns with the same label remain isolated'
+);
+
+const genericIdentity = getGenericSessionIdentity({ headers: { 'x-spilli-session-id': 'generic-chat' } });
+assert.match(genericIdentity.key, /^spilli:/);
+assert.match(genericIdentity.contextId, /^spilli-context-/);
+
 const promptChangedHistory = buildHistoryStateForAnthropic({
   model: 'spilli-test',
   system: 'Be verbose.',
@@ -993,7 +1065,8 @@ const promptChangedHistory = buildHistoryStateForAnthropic({
 const promptChangedPrepared = prepareSessionRunPayload(promptChangedHistory, previousAfterAssistant, resourceKey);
 assert.equal(promptChangedPrepared.reused, false, 'prompt changes force a fresh full-history session');
 assert.equal(promptChangedPrepared.payload.prompt, promptChangedHistory.prompt);
-assert.equal(promptChangedPrepared.payload.query, promptChangedHistory.query);
+assert.equal(promptChangedPrepared.payload.query, 'USER:\nNext question');
+assert.equal(promptChangedPrepared.hydrationItems.length, 2);
 
 const compactedHistory = buildHistoryStateForAnthropic({
   model: 'spilli-test',
@@ -1005,7 +1078,8 @@ const compactedHistory = buildHistoryStateForAnthropic({
 });
 const compactedPrepared = prepareSessionRunPayload(compactedHistory, previousAfterAssistant, resourceKey);
 assert.equal(compactedPrepared.reused, false, 'rewritten or compacted history forces a fresh session');
-assert.equal(compactedPrepared.payload.query, compactedHistory.query);
+assert.equal(compactedPrepared.payload.query, 'USER:\nContinue from there');
+assert.equal(compactedPrepared.hydrationItems.length, 1);
 
 const smallToolResultHistory = buildHistoryStateForAnthropic(
   {

@@ -57,13 +57,14 @@ Treat `SpilliSession` as an acquired network resource, not as chat memory. The A
 
 Do:
 
-- Resolve stable identity from Codex `x-codex-turn-metadata`, Claude Code `x-claude-code-session-id`, or the generic `x-spilli-session-id` header.
+- Resolve stable identity from current Codex `session-id`/`thread-id` headers (with legacy `x-codex-turn-metadata` fallback), Claude Code `x-claude-code-session-id`, or generic `x-spilli-session-id`.
 - Map Codex `thread_id` to `context_id`; derive a stable context id for clients that expose only one session id.
 - Keep a committed revision and transcript-hash cursor per client conversation.
 - Use `hydrate` for first use, reconnects, resource changes, and any history rewrite or compaction.
 - Put prior structured messages in `recent_messages` during hydration and keep the current input in `query`.
 - Use `delta` only for a strict append-only continuation, send only the new suffix in `query`, and include `delta_messages: []`.
 - Retry `SPILLI_CONTEXT_MISS` once at the same revision with a hydration snapshot.
+- Isolate `x-openai-subagent` requests from their parent context and use ephemeral leases for those short-lived contexts.
 - Commit the revision and emitted assistant hashes only after inference succeeds.
 - Serialize native runs by resource to avoid overlapping callbacks on the shared SDK client.
 
