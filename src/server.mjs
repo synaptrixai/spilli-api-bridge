@@ -1498,6 +1498,27 @@ function selectPreferredDisplayMatch(matches) {
   return undefined;
 }
 
+const CLAUDE_DISCOVERY_MODEL_PREFIX = 'claude-spilli-';
+
+function claudeDiscoveryModelId(modelId) {
+  const id = String(modelId ?? '').trim();
+  return /^(claude|anthropic)/i.test(id)
+    ? id
+    : `${CLAUDE_DISCOVERY_MODEL_PREFIX}${Buffer.from(id, 'utf8').toString('base64url')}`;
+}
+
+function sourceModelIdFromClaudeDiscoveryModelId(modelId) {
+  const encoded = String(modelId ?? '').trim().slice(CLAUDE_DISCOVERY_MODEL_PREFIX.length);
+  if (!encoded) {
+    return '';
+  }
+  try {
+    return Buffer.from(encoded, 'base64url').toString('utf8').trim();
+  } catch {
+    return encoded;
+  }
+}
+
 function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map()) {
   const requested = requestedModel.trim();
   if (!catalog.models.length) {
@@ -1505,6 +1526,12 @@ function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map
   }
   if (!requested) {
     return catalog.models[0];
+  }
+  if (requested.startsWith(CLAUDE_DISCOVERY_MODEL_PREFIX)) {
+    const sourceModelId = sourceModelIdFromClaudeDiscoveryModelId(requested);
+    if (sourceModelId) {
+      return resolveModelFromCatalog(sourceModelId, catalog, modelAliases);
+    }
   }
   const exactUid = catalog.models.find(model => model.uid === requested);
   if (exactUid) {
@@ -6130,27 +6157,54 @@ async function handleOpenAiChatCompletions(req, res, config) {
   }
 }
 
-async function handleModels(req, res, config) {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
-  const forceRefresh = url.searchParams.get('refresh') === 'true' || url.searchParams.get('force') === 'true';
-  const catalog = await fetchAvailableModels(config, { forceRefresh });
-  json(res, 200, {
+function buildModelsResponse(catalog, { claudeDiscovery = false } = {}) {
+  return {
     object: 'list',
     data: catalog.models.map(model => ({
-      id: model.apiName,
+      id: claudeDiscovery ? claudeDiscoveryModelId(model.apiName) : model.apiName,
       object: 'model',
       type: 'model',
       created: 0,
       created_at: '1970-01-01T00:00:00.000Z',
       owned_by: 'spilli',
+      max_input_tokens: 0,
+      max_tokens: 0,
+      capabilities: {
+        batch: { supported: false },
+        citations: { supported: false },
+        code_execution: { supported: false },
+        context_management: { supported: false },
+        image_input: { supported: false },
+        pdf_input: { supported: false },
+        structured_outputs: { supported: false },
+        thinking: { supported: false, types: {} }
+      },
       uid: model.uid,
       display_name: model.displayName,
       host_count: model.count
     })),
     has_more: false,
-    first_id: catalog.models[0]?.apiName ?? null,
-    last_id: catalog.models[catalog.models.length - 1]?.apiName ?? null
-  });
+    first_id: catalog.models[0]
+      ? (claudeDiscovery ? claudeDiscoveryModelId(catalog.models[0].apiName) : catalog.models[0].apiName)
+      : null,
+    last_id: catalog.models.length
+      ? (claudeDiscovery
+          ? claudeDiscoveryModelId(catalog.models[catalog.models.length - 1].apiName)
+          : catalog.models[catalog.models.length - 1].apiName)
+      : null
+  };
+}
+
+async function handleModels(req, res, config) {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
+  const forceRefresh = url.searchParams.get('refresh') === 'true' || url.searchParams.get('force') === 'true';
+  // Claude Code's gateway discovery request uses `?limit=1000` and only
+  // accepts IDs beginning with "claude" or "anthropic". Advertise reversible
+  // aliases for that client while keeping the ordinary OpenAI-compatible
+  // catalog unchanged for Codex and other callers.
+  const claudeDiscovery = url.searchParams.get('limit') === '1000';
+  const catalog = await fetchAvailableModels(config, { forceRefresh });
+  json(res, 200, buildModelsResponse(catalog, { claudeDiscovery }));
 }
 
 
@@ -6893,6 +6947,7 @@ const server = http.createServer((req, res) => {
 
 export {
   buildResponsesWebSearchHydratedPayload,
+  buildModelsResponse,
   buildResource,
   buildSpilliContextReleaseControl,
   buildToolSchemaPrompt,

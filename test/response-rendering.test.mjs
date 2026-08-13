@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  buildModelsResponse,
   buildResource,
   buildSpilliContextReleaseControl,
   buildToolSchemaPrompt,
@@ -815,6 +816,38 @@ assert.deepEqual(
     { uid: 'Named Public Model', displayName: 'Named Public Model', count: 0 }
   ],
   'merges backend public catalog models with host inventory and drops unlabeled hashed catalog-only models'
+);
+
+const responseCatalogModels = mergedPublicModels.map(model => ({ ...model, apiName: model.displayName }));
+const modelsResponse = buildModelsResponse({ models: responseCatalogModels });
+assert.equal(modelsResponse.object, 'list', 'models response keeps OpenAI list object marker');
+assert.equal(modelsResponse.data[0].object, 'model', 'models response keeps OpenAI model object marker');
+assert.equal(modelsResponse.data[0].type, 'model', 'models response includes Anthropic model type marker');
+assert.equal(modelsResponse.data[0].display_name, 'tinygemma3-Q8_0.gguf', 'models response includes Anthropic display name');
+assert.equal(modelsResponse.data[0].created_at, '1970-01-01T00:00:00.000Z', 'models response includes Anthropic created_at');
+assert.equal(modelsResponse.data[0].max_input_tokens, 0, 'models response includes Anthropic max_input_tokens');
+assert.equal(modelsResponse.data[0].max_tokens, 0, 'models response includes Anthropic max_tokens');
+assert.deepEqual(
+  modelsResponse.data[0].capabilities.structured_outputs,
+  { supported: false },
+  'models response includes conservative Anthropic capabilities'
+);
+assert.equal(modelsResponse.first_id, 'tinygemma3-Q8_0.gguf', 'models response exposes first_id pagination marker');
+assert.equal(modelsResponse.last_id, 'Named Public Model', 'models response exposes last_id pagination marker');
+
+const claudeModelsResponse = buildModelsResponse(
+  { models: responseCatalogModels },
+  { claudeDiscovery: true }
+);
+assert.equal(
+  claudeModelsResponse.data[0].id,
+  'claude-spilli-dGlueWdlbW1hMy1ROF8wLmdndWY',
+  'Claude discovery receives a picker-compatible reversible model id'
+);
+assert.equal(
+  claudeModelsResponse.data[0].display_name,
+  'tinygemma3-Q8_0.gguf',
+  'Claude discovery preserves the SpiLLI display name'
 );
 
 assert.deepEqual(
