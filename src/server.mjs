@@ -55,6 +55,10 @@ const state = {
   modelScope: 'public',
   modelTeam: undefined,
   resourceRunQueues: new Map(),
+  // A utility request gets its own native SDK client and queue. The SDK stream
+  // cancellation primitive is client-wide, so sharing it with an interactive
+  // turn can leak a timed-out utility stream into the next queued run.
+  sessionRunQueueKeys: new WeakMap(),
   // Maps SpiLLI resource keys to one live SDK transport/allocation. Logical
   // chat histories are separated by spilli_context identities over this transport.
   resourceSessions: new Map(),
@@ -299,8 +303,21 @@ function isClaudeUtilityRequest(req, body = {}) {
   );
 }
 
+function isCodexUtilityRequest(req) {
+  if (!getCodexSessionIdentity(req)) {
+    return false;
+  }
+  const metadata = parseCodexTurnMetadata(req);
+  const threadSource = asString(metadata.thread_source ?? metadata.threadSource).trim().toLowerCase();
+  return threadSource === 'system';
+}
+
+function isUtilityRequest(req, body = {}) {
+  return isClaudeUtilityRequest(req, body) || isCodexUtilityRequest(req);
+}
+
 function getLeaseKindForRequest(req, body = {}) {
-  return isClaudeSubagentRequest(req, body) || isClaudeUtilityRequest(req, body) || Boolean(getCodexSubagentKind(req))
+  return isClaudeSubagentRequest(req, body) || isUtilityRequest(req, body) || Boolean(getCodexSubagentKind(req))
     ? 'ephemeral'
     : 'durable';
 }
@@ -632,18 +649,31 @@ function resolveHighestTierSpilliKeyFile(configuredPath) {
   return resolved;
 }
 
+function createConfiguredService(config) {
+  const resolved = resolveHighestTierSpilliKeyFile(config.keyPath);
+  const options = {};
+  if (config.nativeCacheDir) {
+    options.nativeCacheDir = path.resolve(expandHome(config.nativeCacheDir));
+  }
+  return {
+    keyFilePath: resolved.keyFilePath,
+    service: createSpilliService(resolved.keyFilePath, options)
+  };
+}
+
 function getService(config) {
   const resolved = resolveHighestTierSpilliKeyFile(config.keyPath);
   if (state.service && state.keyPath === resolved.keyFilePath) {
     return state.service;
   }
-  const options = {};
-  if (config.nativeCacheDir) {
-    options.nativeCacheDir = path.resolve(expandHome(config.nativeCacheDir));
-  }
-  state.service = createSpilliService(resolved.keyFilePath, options);
+  const configured = createConfiguredService(config);
+  state.service = configured.service;
   state.keyPath = resolved.keyFilePath;
   return state.service;
+}
+
+function createIsolatedService(config) {
+  return createConfiguredService(config).service;
 }
 
 function buildApiUrl(baseUrl, apiPath) {
@@ -1600,6 +1630,58 @@ function extractJsonObjectRanges(body) {
   return ranges;
 }
 
+function extractJsonValueRanges(body) {
+  const ranges = [];
+  let start = -1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let opener = '';
+  const closerFor = { '{': '}', '[': ']' };
+  const openers = new Set(Object.keys(closerFor));
+  const closers = new Set(Object.values(closerFor));
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (start < 0) {
+      if (openers.has(char)) {
+        start = index;
+        depth = 1;
+        opener = char;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (openers.has(char)) {
+      depth += 1;
+      continue;
+    }
+    if (closers.has(char)) {
+      depth -= 1;
+      if (depth === 0) {
+        if (char === closerFor[opener]) {
+          ranges.push(body.slice(start, index + 1));
+        }
+        start = -1;
+        opener = '';
+      }
+    }
+  }
+  return ranges;
+}
+
 function parseToolArguments(value) {
   if (isRecord(value)) {
     return value;
@@ -1706,8 +1788,29 @@ function extractAvailableToolNames(tools) {
     return [];
   }
   return tools
-    .map(tool => (isRecord(tool) ? asString(tool.name || tool.function?.name).trim() : ''))
+    .map(tool => {
+      if (!isRecord(tool)) {
+        return '';
+      }
+      const name = asString(tool.name || tool.function?.name).trim();
+      if (name) {
+        return name;
+      }
+      return asString(tool.type).trim().toLowerCase() === 'web_search' ? 'web_search' : '';
+    })
     .filter(Boolean);
+}
+
+function extractRequestedToolNames(body) {
+  const names = new Set(extractAvailableToolNames(body?.tools));
+  const toolNames = Array.isArray(body?.tool_names) ? body.tool_names : Array.isArray(body?.toolNames) ? body.toolNames : [];
+  for (const name of toolNames) {
+    const trimmed = asString(name).trim();
+    if (trimmed) {
+      names.add(trimmed);
+    }
+  }
+  return [...names];
 }
 
 function extractResponsesToolTypes(tools) {
@@ -1719,11 +1822,13 @@ function extractResponsesToolTypes(tools) {
     if (!isRecord(tool)) {
       continue;
     }
-    const name = asString(tool.name || tool.function?.name).trim();
+    const explicitName = asString(tool.name || tool.function?.name).trim();
+    const type = asString(tool.type || 'function').trim().toLowerCase() || 'function';
+    const name = explicitName || (type === 'web_search' ? 'web_search' : '');
     if (!name) {
       continue;
     }
-    types[normalizeToolNameForLookup(name)] = asString(tool.type || 'function').trim().toLowerCase() || 'function';
+    types[normalizeToolNameForLookup(name)] = type;
   }
   return types;
 }
@@ -2401,6 +2506,30 @@ function collectLooseToolAssignments(raw, calls) {
   }
 }
 
+function collectXmlLikeToolCalls(raw, calls, allowedToolNames = []) {
+  const text = String(raw ?? '');
+  const regex = /<([A-Za-z_][\w.-]*)>\s*([\s\S]*?)\s*<\/\1>/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const name = asString(match[1]).trim();
+    if (!resolveAllowedToolName(name, allowedToolNames)) {
+      continue;
+    }
+    const content = asString(match[2]).trim();
+    const parsed = tryParseJson(content);
+    const input = isRecord(parsed)
+      ? parsed
+      : ['web_search', 'websearch'].includes(normalizeToolNameForLookup(name))
+        ? { query: content }
+        : content;
+    calls.push({
+      id: `toolu_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+      name,
+      input
+    });
+  }
+}
+
 function parseToolCallsFromOutput(raw, allowedToolNames = []) {
   const calls = [];
   const parsedHarmony = parseHarmonyOutput(raw);
@@ -2457,10 +2586,11 @@ function parseToolCallsFromOutput(raw, allowedToolNames = []) {
     const parsed = tryParseJson((match[1] ?? '').trim());
     collectToolCalls(parsed, calls);
   }
-  for (const candidate of extractJsonObjectRanges(raw)) {
+  for (const candidate of extractJsonValueRanges(raw)) {
     collectToolCalls(tryParseJson(candidate), calls);
   }
   collectLooseToolAssignments(raw, calls);
+  collectXmlLikeToolCalls(raw, calls, allowedToolNames);
   const seen = new Set();
   const normalizedCalls = [];
   for (const call of calls) {
@@ -3021,12 +3151,22 @@ function normalizeToolForPrompt(tool) {
   if (!isRecord(tool)) {
     return undefined;
   }
-  const name = asString(tool.name || tool.function?.name).trim();
+  const type = asString(tool.type).trim().toLowerCase();
+  const name = asString(tool.name || tool.function?.name).trim() || (type === 'web_search' ? 'web_search' : '');
   if (!name) {
     return undefined;
   }
-  const description = asString(tool.description || tool.function?.description).trim();
-  const inputSchema = tool.input_schema || tool.inputSchema || tool.function?.parameters || tool.function?.input_schema;
+  const description = asString(tool.description || tool.function?.description).trim() || (type === 'web_search'
+    ? 'Search the public web for current or externally verifiable information. Use this when freshness or online lookup is needed.'
+    : '');
+  const inputSchema = tool.input_schema || tool.inputSchema || tool.function?.parameters || tool.function?.input_schema || (type === 'web_search'
+    ? {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'The web search query.' } },
+        required: ['query'],
+        additionalProperties: false
+      }
+    : undefined);
   const normalized = {
     name,
     ...(description ? { description } : {}),
@@ -3047,6 +3187,7 @@ function sortedToolsForPrompt(tools) {
     ['write', 2],
     ['bash', 3],
     ['websearch', 4],
+    ['web_search', 4],
     ['webfetch', 5],
     ['agent', 6],
     ['askuserquestion', 7]
@@ -3860,20 +4001,27 @@ async function withResourceRunQueue(resource, callback) {
   return withResourceKeyRunQueue(resourceCacheKey(resource), callback);
 }
 
-async function requestSpilliSessionForResource(service, resource, timeoutMs) {
+function runQueueKeyForSession(session, resourceKey) {
+  return state.sessionRunQueueKeys.get(session) ?? resourceKey;
+}
+
+async function requestSpilliSessionForResource(service, resource, timeoutMs, options = {}) {
   const key = resourceCacheKey(resource);
+  const reuse = options.reuse !== false;
+  const queueKey = asString(options.queueKey).trim() || key;
   await appendLog({
     timestamp: new Date().toISOString(),
     kind: 'spilli.allocation.queued',
-    allocation: { resourceKey: key }
+    allocation: { resourceKey: key, queueKey, reusable: reuse }
   }, 'ALLOC');
-  return withResourceRunQueue(resource, async () => {
-    const existing = state.resourceSessions.get(key);
+  return withResourceKeyRunQueue(queueKey, async () => {
+    const existing = reuse ? state.resourceSessions.get(key) : undefined;
     if (existing?.isLive?.()) {
+      state.sessionRunQueueKeys.set(existing, queueKey);
       await appendLog({
         timestamp: new Date().toISOString(),
         kind: 'spilli.allocation.reuse',
-        allocation: { resourceKey: key, sessionLive: true }
+        allocation: { resourceKey: key, queueKey, reusable: reuse, sessionLive: true }
       }, 'ALLOC');
       return existing;
     }
@@ -3883,25 +4031,30 @@ async function requestSpilliSessionForResource(service, resource, timeoutMs) {
     await appendLog({
       timestamp: new Date().toISOString(),
       kind: 'spilli.allocation.start',
-      allocation: { resourceKey: key }
+      allocation: { resourceKey: key, queueKey, reusable: reuse }
     }, 'ALLOC');
     try {
       const session = await service.request(resource, timeoutMs);
-      if (session?.isLive?.()) {
+      if (session && (typeof session === 'object' || typeof session === 'function')) {
+        state.sessionRunQueueKeys.set(session, queueKey);
+      }
+      if (reuse && session?.isLive?.()) {
         state.resourceSessions.set(key, session);
       }
       await appendLog({
         timestamp: new Date().toISOString(),
         kind: 'spilli.allocation.complete',
-        allocation: { resourceKey: key, sessionLive: session?.isLive?.() === true }
+        allocation: { resourceKey: key, queueKey, reusable: reuse, sessionLive: session?.isLive?.() === true }
       }, 'ALLOC');
       return session;
     } catch (error) {
-      state.resourceSessions.delete(key);
+      if (reuse) {
+        state.resourceSessions.delete(key);
+      }
       await appendLog({
         timestamp: new Date().toISOString(),
         kind: 'spilli.allocation.error',
-        allocation: { resourceKey: key },
+        allocation: { resourceKey: key, queueKey, reusable: reuse },
         error: errorSummary(error)
       }, 'ALLOC');
       throw error;
@@ -3915,8 +4068,9 @@ async function runInference(payload, config, streamOptions = {}, session, resolv
   const resolvedModel = resolvedModelOverride ?? await resolveRequestedModel(requestedModel, config);
   const resource = buildResource(resolvedModel, config);
   const resourceKey = resourceCacheKey(resource);
+  const runQueueKey = runQueueKeyForSession(session, resourceKey);
   const apiModelName = requestedModel || resolvedModel.displayName;
-  return withResourceRunQueue(resource, async () => {
+  return withResourceKeyRunQueue(runQueueKey, async () => {
     const activeSession = session?.isLive?.() ? session : undefined;
     if (!activeSession?.isLive?.()) {
       throw Object.assign(new Error('SpiLLI model session is not live.'), { statusCode: 503 });
@@ -3962,6 +4116,7 @@ async function runInference(payload, config, streamOptions = {}, session, resolv
           requestedModel: apiModelName,
           resolvedUid: resolvedModel.uid,
           resourceKey,
+          runQueueKey,
           rawLength: raw.length,
           rawPreview: raw.slice(0, 2000),
           spilliContext: summarizeContextPayload(payload.spilliContext)
@@ -4047,7 +4202,7 @@ async function releaseChatSessionEntry(sessionKey, entry, config, reason = 'brid
     }
   }, 'SESSION');
   try {
-    await withResourceKeyRunQueue(entry.resourceKey ?? '', async () => {
+    await withResourceKeyRunQueue(runQueueKeyForSession(entry.session, entry.resourceKey ?? ''), async () => {
       if (entry.session?.isLive?.()) {
         if (typeof entry.session.releaseContext === 'function') {
           await entry.session.releaseContext(control, { timeoutMs: config.allocationTimeoutMs });
@@ -4163,7 +4318,8 @@ async function getOrCreateClientSession(req, historyState, config, body = {}) {
     ? specializeSessionIdentityForHistory(baseIdentity, historyState, req)
     : baseIdentity;
   const sessionKey = identity.key;
-  const service = getService(config);
+  const utilityRequest = isUtilityRequest(req, body);
+  const service = utilityRequest ? createIsolatedService(config) : getService(config);
   const resolvedModel = await resolveRequestedModel(historyState.requestedModel, config);
   const resource = buildResource(resolvedModel, config);
   const resourceKey = resourceCacheKey(resource);
@@ -4227,9 +4383,14 @@ async function getOrCreateClientSession(req, historyState, config, body = {}) {
     await evictIdleDurableContextsForResource(resourceKey, sessionKey, config, 'bridge_durable_lru_limit');
   }
 
+  const isolatedQueueKey = utilityRequest
+    ? `utility:${clientKind}:${identity.contextId}:${nextRevision}:${crypto.randomUUID()}`
+    : undefined;
   const chosenSession = prepared.reused
     ? reusablePreviousEntry.session
-    : await requestSpilliSessionForResource(service, resource, config.allocationTimeoutMs);
+    : await requestSpilliSessionForResource(service, resource, config.allocationTimeoutMs, utilityRequest
+        ? { reuse: false, queueKey: isolatedQueueKey }
+        : undefined);
   if (discoveredIdentity) {
     state.chatSessions.set(sessionKey, {
       session: chosenSession,
@@ -5193,16 +5354,16 @@ function requestHasTools(body) {
   return extractAvailableToolNames(body?.tools).length > 0;
 }
 
-async function runAnthropicInferenceWithRetry(payload, config, options) {
+async function runInferenceWithContextRetry(payload, config, options = {}) {
   let retried = false;
   let result;
   try {
     result = await runInference(
       payload,
       config,
-      options?.streamOptions ?? {},
-      options?.session,
-      options?.resolvedModel
+      options.streamOptions ?? {},
+      options.session,
+      options.resolvedModel
     );
   } catch (error) {
     if (error?.spilliError !== 'SPILLI_CONTEXT_MISS' || !payload.retryHydratePayload) {
@@ -5221,11 +5382,107 @@ async function runAnthropicInferenceWithRetry(payload, config, options) {
     result = await runInference(
       payload.retryHydratePayload,
       config,
-      options?.streamOptions ?? {},
-      options?.session,
-      options?.resolvedModel
+      options.streamOptions ?? {},
+      options.session,
+      options.resolvedModel
     );
   }
+  return { result, retried };
+}
+
+function hasBuiltInResponsesWebSearch(body) {
+  const hasWebSearchTool = Array.isArray(body?.tools) && body.tools.some(tool => (
+    isRecord(tool) &&
+    asString(tool.type).trim().toLowerCase() === 'web_search' &&
+    tool.external_web_access !== false
+  ));
+  return hasWebSearchTool || extractRequestedToolNames(body).some(name => (
+    ['web_search', 'websearch'].includes(normalizeToolNameForLookup(name))
+  ));
+}
+
+function webSearchCallFromRaw(raw, allowedToolNames) {
+  return parseToolCallsFromOutput(raw, allowedToolNames).find(call => (
+    ['web_search', 'websearch'].includes(normalizeToolNameForLookup(call.name)) &&
+    asString(call.input?.query || call.input?.search_query || call.input?.q).trim()
+  ));
+}
+
+function buildResponsesWebSearchHydratedPayload(payload, query, searchText) {
+  const hydrateBase = payload.retryHydratePayload ?? payload;
+  return {
+    ...hydrateBase,
+    query: [
+      hydrateBase.query,
+      `ASSISTANT TOOL CALL web_search:\n${JSON.stringify({ query })}`,
+      `TOOL RESULT web_search:\n${searchText}`,
+      'Answer the user using the web search results above. Cite relevant result URLs as markdown links. Do not call web_search again for this answer.'
+    ].filter(Boolean).join('\n\n')
+  };
+}
+
+async function runResponsesInferenceWithWebSearch(payload, body, config, options = {}) {
+  const firstRun = await runInferenceWithContextRetry(payload, config, options);
+  const webSearchEnabled = hasBuiltInResponsesWebSearch(body);
+  if (config.responseMode === 'raw' || !webSearchEnabled) {
+    await appendLog({
+      timestamp: new Date().toISOString(),
+      kind: 'openai.responses.web_search.skip',
+      webSearch: {
+        reason: config.responseMode === 'raw' ? 'raw_response_mode' : 'web_search_not_requested',
+        responseMode: config.responseMode,
+        toolNames: extractRequestedToolNames(body),
+        toolTypes: Array.isArray(body?.tools)
+          ? body.tools.map(tool => isRecord(tool) ? asString(tool.type || tool.name || tool.function?.name).trim() : typeof tool)
+          : []
+      }
+    }, 'WEB');
+    return { ...firstRun, webSearch: undefined };
+  }
+
+  const allowedToolNames = extractRequestedToolNames(body);
+  const call = webSearchCallFromRaw(firstRun.result.raw, allowedToolNames);
+  if (!call) {
+    await appendLog({
+      timestamp: new Date().toISOString(),
+      kind: 'openai.responses.web_search.skip',
+      webSearch: {
+        reason: 'no_web_search_call',
+        allowedToolNames,
+        rawPreview: asString(firstRun.result.raw).slice(0, 1000)
+      }
+    }, 'WEB');
+    return { ...firstRun, webSearch: undefined };
+  }
+
+  const query = asString(call.input?.query || call.input?.search_query || call.input?.q).trim();
+  const search = await runBridgeWebSearch(query, config);
+  const searchText = formatWebSearchResults(query, search.results, search.provider);
+  const hydratedPayload = buildResponsesWebSearchHydratedPayload(payload, query, searchText);
+  const result = await runInference(
+    hydratedPayload,
+    config,
+    options.streamOptions ?? {},
+    options.session,
+    options.resolvedModel
+  );
+  const webSearch = {
+    query,
+    provider: search.provider,
+    resultCount: search.results.length,
+    errors: search.errors ?? []
+  };
+  await appendLog({
+    timestamp: new Date().toISOString(),
+    kind: 'openai.responses.web_search',
+    webSearch,
+    context: summarizeContextPayload(hydratedPayload.spilliContext)
+  }, 'WEB');
+  return { result, retried: firstRun.retried, webSearch };
+}
+
+async function runAnthropicInferenceWithRetry(payload, config, options) {
+  const { result, retried } = await runInferenceWithContextRetry(payload, config, options);
   let message = toAnthropicMessage({
     id: options.id,
     model: result.requestedModel,
@@ -5707,40 +5964,44 @@ async function handleOpenAiChatCompletions(req, res, config) {
     let completed = false;
     let finishReason = 'bridge_request_failure';
     try {
-      const result = await runInference(payload, config, {
-        onStart: ({ requestedModel }) => {
-          streamModel = requestedModel;
-          res.write(`data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model: requestedModel,
-            choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-          })}\n\n`);
-        },
-        onChunk: chunk => {
-          rawForStream += chunk;
-          if (!rawMode) {
-            return;
+      const { result } = await runInferenceWithContextRetry(payload, config, {
+        session: chosenSession,
+        resolvedModel,
+        streamOptions: {
+          onStart: ({ requestedModel }) => {
+            streamModel = requestedModel;
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model: requestedModel,
+              choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+            })}\n\n`);
+          },
+          onChunk: chunk => {
+            rawForStream += chunk;
+            if (!rawMode) {
+              return;
+            }
+            const nextText = rawForStream;
+            if (!nextText || !nextText.startsWith(streamedText)) {
+              return;
+            }
+            const delta = nextText.slice(streamedText.length);
+            streamedText = nextText;
+            if (!delta) {
+              return;
+            }
+            res.write(`data: ${JSON.stringify({
+              id,
+              object: 'chat.completion.chunk',
+              created,
+              model: streamModel,
+              choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
+            })}\n\n`);
           }
-          const nextText = rawForStream;
-          if (!nextText || !nextText.startsWith(streamedText)) {
-            return;
-          }
-          const delta = nextText.slice(streamedText.length);
-          streamedText = nextText;
-          if (!delta) {
-            return;
-          }
-          res.write(`data: ${JSON.stringify({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model: streamModel,
-            choices: [{ index: 0, delta: { content: delta }, finish_reason: null }]
-          })}\n\n`);
         }
-      }, chosenSession, resolvedModel);
+      });
       const completion = toOpenAiChatCompletion({
         id,
         model: result.requestedModel,
@@ -5835,7 +6096,10 @@ async function handleOpenAiChatCompletions(req, res, config) {
   let completed = false;
   let finishReason = 'bridge_request_failure';
   try {
-    const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
+    const { result } = await runInferenceWithContextRetry(payload, config, {
+      session: chosenSession,
+      resolvedModel
+    });
     const completion = toOpenAiChatCompletion({
       id,
       model: result.requestedModel,
@@ -6004,7 +6268,7 @@ function responsesToSpilliPayload(body) {
   };
 }
 
-function buildHistoryStateForResponses(body) {
+function buildHistoryStateForResponses(body, options = {}) {
   const input = body.input;
   const inputItems = Array.isArray(input) ? input : [];
 
@@ -6019,7 +6283,9 @@ function buildHistoryStateForResponses(body) {
     .filter(Boolean)
     .join('\n\n');
 
+  const toolSchemaPrompt = buildToolSchemaPrompt(body?.tools, options);
   const prompt = [
+    toolSchemaPrompt,
     asString(body.instructions).trim(),
     promptFromInputItems
   ]
@@ -6044,7 +6310,7 @@ function buildHistoryStateForResponses(body) {
 }
 
 async function buildHistoryStateForResponsesWithContextPolicy(body, config, resolvedModel) {
-  return applyContextPolicyToHistoryState(buildHistoryStateForResponses(body), config, resolvedModel);
+  return applyContextPolicyToHistoryState(buildHistoryStateForResponses(body, config), config, resolvedModel);
 }
 
 function createResponseId(prefix = 'resp') {
@@ -6296,37 +6562,41 @@ async function handleOpenAiResponses(req, res, config) {
       const sessionRun = await getOrCreateClientSession(req, historyState, config, body);
       finishSession = sessionRun.finishSession;
       const { chosenSession, resolvedModel, payload, commitHistory } = sessionRun;
-      const result = await runInference(payload, config, {
-        onStart: ({ requestedModel }) => {
-          streamModel = requestedModel || streamModel;
-        },
+      const { result, webSearch } = await runResponsesInferenceWithWebSearch(payload, body, config, {
+        session: chosenSession,
+        resolvedModel,
+        streamOptions: {
+          onStart: ({ requestedModel }) => {
+            streamModel = requestedModel || streamModel;
+          },
 
-        onChunk: (chunk) => {
-          rawForStream += chunk;
-          if (!rawMode) {
-            return;
+          onChunk: (chunk) => {
+            rawForStream += chunk;
+            if (!rawMode) {
+              return;
+            }
+
+            const nextText = rawForStream;
+
+            if (!nextText || !nextText.startsWith(streamedText)) return;
+
+            const delta = nextText.slice(streamedText.length);
+            streamedText = nextText;
+
+            if (!delta) return;
+
+            ensureTextOutputStarted();
+
+            emit({
+              type: 'response.output_text.delta',
+              item_id: messageId,
+              output_index: 0,
+              content_index: 0,
+              delta
+            });
           }
-
-          const nextText = rawForStream;
-
-          if (!nextText || !nextText.startsWith(streamedText)) return;
-
-          const delta = nextText.slice(streamedText.length);
-          streamedText = nextText;
-
-          if (!delta) return;
-
-          ensureTextOutputStarted();
-
-          emit({
-            type: 'response.output_text.delta',
-            item_id: messageId,
-            output_index: 0,
-            content_index: 0,
-            delta
-          });
         }
-      }, chosenSession, resolvedModel);
+      });
 
       const { output, toolCalls } = toResponsesOutputItems({
         raw: result.raw,
@@ -6348,6 +6618,7 @@ async function handleOpenAiResponses(req, res, config) {
         // raw: result.raw,
         // harmony: rawMode ? undefined : harmonySummary(result.raw),
         parsedToolCalls: toolCalls,
+        webSearch,
         // emittedOutput: output
       });
 
@@ -6467,7 +6738,10 @@ async function handleOpenAiResponses(req, res, config) {
   let requestCompleted = false;
   let finishReason = 'bridge_request_failure';
   try {
-    const result = await runInference(payload, config, {}, chosenSession, resolvedModel);
+    const { result, webSearch } = await runResponsesInferenceWithWebSearch(payload, body, config, {
+      session: chosenSession,
+      resolvedModel
+    });
 
     const { output, toolCalls } = toResponsesOutputItems({
       raw: result.raw,
@@ -6488,6 +6762,7 @@ async function handleOpenAiResponses(req, res, config) {
       // raw: result.raw,
       // harmony: rawMode ? undefined : harmonySummary(result.raw),
       parsedToolCalls: toolCalls,
+      webSearch,
       // emittedOutput: output
     });
 
@@ -6617,6 +6892,7 @@ const server = http.createServer((req, res) => {
 });
 
 export {
+  buildResponsesWebSearchHydratedPayload,
   buildResource,
   buildSpilliContextReleaseControl,
   buildToolSchemaPrompt,
@@ -6631,11 +6907,13 @@ export {
   getCodexSessionIdentity,
   getGenericSessionIdentity,
   getLeaseKindForRequest,
+  isCodexUtilityRequest,
   limitHistoryItemsForModelContext,
   mergePublicModels,
   maybeBuildClaudeWebSearchHelperMessage,
   normalizePublicCatalogModels,
   prepareSessionRunPayload,
+  extractRequestedToolNames,
   parseToolCallsFromOutput,
   specializeSessionIdentityForHistory,
   withResourceRunQueue,

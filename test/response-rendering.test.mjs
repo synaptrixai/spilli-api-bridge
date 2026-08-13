@@ -11,18 +11,21 @@ import {
   buildHistoryStateForAnthropic,
   buildHistoryStateForOpenAiChat,
   buildHistoryStateForResponses,
+  buildResponsesWebSearchHydratedPayload,
   extractHarmonyFinalText,
   extractSearchResultsFromValue,
   formatWebSearchResults,
   getCodexSessionIdentity,
   getGenericSessionIdentity,
   getLeaseKindForRequest,
+  isCodexUtilityRequest,
   isDegenerateSpilliOutput,
   limitHistoryItemsForModelContext,
   maybeBuildClaudeWebSearchHelperMessage,
   mergePublicModels,
   normalizePublicCatalogModels,
   prepareSessionRunPayload,
+  extractRequestedToolNames,
   parseToolCallsFromOutput,
   renderText,
   resourceCacheKey,
@@ -641,6 +644,65 @@ assert.match(formattedSearchResults, /Web search results for query: "India Engla
 assert.match(formattedSearchResults, /India vs England scorecard \(https:\/\/example\.test\/india-england\)/);
 assert.match(formattedSearchResults, /Use the result titles and URLs above as markdown hyperlinks/);
 
+const codexWebSearchHistory = buildHistoryStateForResponses({
+  model: 'gpt-oss:20b',
+  instructions: 'You are Codex.',
+  tools: [{ type: 'web_search', external_web_access: true }],
+  input: [{ role: 'user', content: 'Find the latest Apple stock price.' }]
+}, {
+  renderToolSchemas: true,
+  toolSchemaPromptMaxChars: 24000
+});
+assert.match(codexWebSearchHistory.prompt, /"name": "web_search"/);
+assert.match(codexWebSearchHistory.prompt, /Search the public web/);
+assert.match(codexWebSearchHistory.prompt, /"required": \[\s*"query"\s*\]/);
+
+assert.deepEqual(
+  extractRequestedToolNames({ tool_names: ['exec_command', 'web_search'] }),
+  ['exec_command', 'web_search'],
+  'Responses web search is still detected when only normalized tool_names are available'
+);
+
+const codexWebSearchHydrate = buildResponsesWebSearchHydratedPayload({
+  query: 'delta query that must not be used for recovery',
+  retryHydratePayload: {
+    prompt: 'Codex prompt',
+    query: 'USER:\nFind the latest Apple stock price.',
+    spilliContext: { transfer_mode: 'hydrate', context_revision: 2 },
+    hydrateContext: { transfer_mode: 'hydrate', context_revision: 2 }
+  }
+}, 'Apple stock price', formattedSearchResults);
+assert.equal(codexWebSearchHydrate.spilliContext.transfer_mode, 'hydrate');
+assert.match(codexWebSearchHydrate.query, /USER:\nFind the latest Apple stock price/);
+assert.match(codexWebSearchHydrate.query, /ASSISTANT TOOL CALL web_search/);
+assert.match(codexWebSearchHydrate.query, /India vs England scorecard/);
+assert.match(codexWebSearchHydrate.query, /Do not call web_search again/);
+
+const codexPlainJsonArrayWebCalls = parseToolCallsFromOutput(
+  'I will search for that.\n[{"id":"call_17z24j0958u310d76gk3w1f2","name":"web_search","arguments":{"query":"current Apple stock price AAPL"}}]\n',
+  ['web_search']
+);
+assert.equal(codexPlainJsonArrayWebCalls.length, 1);
+assert.equal(codexPlainJsonArrayWebCalls[0].id, 'call_17z24j0958u310d76gk3w1f2');
+assert.equal(codexPlainJsonArrayWebCalls[0].name, 'web_search');
+assert.equal(codexPlainJsonArrayWebCalls[0].input.query, 'current Apple stock price AAPL');
+
+const codexHarmonyWebCalls = parseToolCallsFromOutput(
+  '<|channel|>analysis<|message|>Need online info.<|end|><|start|>assistant<|channel|>commentary to=web_search <|constrain|>json<|message|>{"query":"latest Apple stock price"}',
+  ['web_search']
+);
+assert.equal(codexHarmonyWebCalls.length, 1);
+assert.equal(codexHarmonyWebCalls[0].name, 'web_search');
+assert.equal(codexHarmonyWebCalls[0].input.query, 'latest Apple stock price');
+
+const codexXmlWebCalls = parseToolCallsFromOutput(
+  '<web_search>\n{"query": "latest Apple stock price"}\n</web_search>',
+  ['web_search']
+);
+assert.equal(codexXmlWebCalls.length, 1);
+assert.equal(codexXmlWebCalls[0].name, 'web_search');
+assert.equal(codexXmlWebCalls[0].input.query, 'latest Apple stock price');
+
 const patchOutput = toResponsesOutputItems({
   raw: patchTool,
   toolsEnabled: true,
@@ -1003,6 +1065,25 @@ assert.equal(modernCodexIdentity.windowId, 'codex');
 assert.equal(modernCodexIdentity.sessionId, 'session-modern');
 assert.match(modernCodexIdentity.key, /^codex:/);
 assert.match(modernCodexIdentity.contextId, /^codex-context-/);
+assert.equal(isCodexUtilityRequest(modernCodexRequest), false, 'normal Codex threads are not utility requests');
+
+const codexSystemUtilityRequest = {
+  headers: {
+    'session-id': 'session-system',
+    'thread-id': 'thread-system',
+    'x-codex-turn-metadata': JSON.stringify({ thread_source: 'system' })
+  }
+};
+assert.equal(
+  isCodexUtilityRequest(codexSystemUtilityRequest),
+  true,
+  'Codex system threads are classified as utility requests'
+);
+assert.equal(
+  getLeaseKindForRequest(codexSystemUtilityRequest),
+  'ephemeral',
+  'Codex system utilities use ephemeral KV leases'
+);
 
 const legacyCodexIdentity = getCodexSessionIdentity({
   headers: {

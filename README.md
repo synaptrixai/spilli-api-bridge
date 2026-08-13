@@ -183,7 +183,7 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_BRIDGE_LOG_TOOL_SCHEMAS`: set to `1` to include full sanitized incoming tool definitions in bridge request logs. Leave unset for normal use; logs include only tool names, description previews, required fields, and input-schema property names.
 - `SPILLI_BRIDGE_REQUEST_LOG_PATH`: optional path for the trace file. Defaults to `~/.spilli/spilli-api-bridge-requests.jsonl`.
 
-When Claude Code sends its internal “web search tool use” request to `/v1/messages`, the bridge resolves that request server-side. It tries `SPILLI_BRIDGE_WEB_SEARCH_ENDPOINT` first when configured, then falls back to DuckDuckGo Instant Answer plus DuckDuckGo HTML search. The returned assistant text is passed by Claude Code back into the main conversation as the WebSearch tool result, including result titles, URLs, snippets, and a reminder to cite the URLs.
+When Claude Code sends its internal “web search tool use” request to `/v1/messages`, the bridge resolves that request server-side. Codex's nameless Responses API built-in `{ "type": "web_search" }` is also exposed to the model and executed server-side by `/v1/responses`; the bridge then freshly hydrates the same revision with the search result and returns the model's final cited answer. Both integrations try `SPILLI_BRIDGE_WEB_SEARCH_ENDPOINT` first when configured, then fall back to DuckDuckGo Instant Answer plus DuckDuckGo HTML search. Results include titles, URLs, snippets, and a reminder to cite the URLs.
 
 ### Summarization Endpoint
 
@@ -262,6 +262,8 @@ The bridge maps client conversation metadata to SpiLLIHost's versioned `spilli_c
 The first turn, rewritten history, model changes, and reconnects use `hydrate`. Hydration places prior committed messages in `recent_messages` and the current input only in `query`. Strict append-only follow-ups use `delta`, leave both context message arrays empty, and send only the uncommitted suffix as `query`. If SpiLLIHost reports `SPILLI_CONTEXT_MISS`, the bridge suppresses that internal marker and retries the same revision once with a fresh prior-message snapshot and the same query.
 
 Codex requests carrying `x-openai-subagent` are isolated from their parent context and use ephemeral host leases. A subagent may reuse the same SDK allocation as its parent, but it never shares the parent's logical `context_id` or revision cursor.
+
+Codex system threads (`thread_source: "system"` in `x-codex-turn-metadata`) and Claude title-generation helpers are utility requests. They use ephemeral host leases plus an isolated SDK transport/run queue. This is important because SDK stream cancellation is transport-wide: a slow or timed-out title request must never block an interactive turn or leave stream output that can be consumed by the next chat delta. Normal chat turns and subagents continue to share the model allocation while keeping independent logical contexts.
 
 Model selection follows the extension's current allocation rule:
 
