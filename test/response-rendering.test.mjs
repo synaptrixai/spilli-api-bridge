@@ -1014,7 +1014,7 @@ const previousAfterAssistant = {
 };
 const secondPrepared = prepareSessionRunPayload(secondAnthropicHistory, previousAfterAssistant, resourceKey);
 assert.equal(secondPrepared.reused, true, 'append-only request reuses the live session');
-assert.equal(secondPrepared.payload.prompt, 'Be concise.', 'the system prompt remains available while chat history is delta-transferred');
+assert.equal(secondPrepared.payload.prompt, '', 'delta transfer does not resend the system prompt');
 assert.equal(
   secondPrepared.payload.query,
   'USER:\nNext question',

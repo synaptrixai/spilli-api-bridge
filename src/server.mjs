@@ -3900,10 +3900,10 @@ function historyItemsToContextMessages(historyItems) {
     .filter(item => item.content);
 }
 
-function createRunPayloadFromHistory(historyState, historyItems) {
+function createRunPayloadFromHistory(historyState, historyItems, transferMode = 'hydrate') {
   return {
     requestedModel: historyState.requestedModel,
-    prompt: historyState.prompt,
+    prompt: transferMode === 'hydrate' ? historyState.prompt : '',
     query: historyItems.map(item => item.text).join('\n\n'),
     ...(historyState.maxTokens ? { max_tokens: historyState.maxTokens } : {})
   };
@@ -3935,7 +3935,7 @@ function prepareSessionRunPayload(historyState, previousEntry, resourceKey) {
     historyItems: queryItems,
     queryItems,
     hydrationItems,
-    payload: createRunPayloadFromHistory(historyState, queryItems)
+    payload: createRunPayloadFromHistory(historyState, queryItems, canReuse ? 'delta' : 'hydrate')
   };
 }
 
@@ -4333,7 +4333,7 @@ async function getOrCreateClientSession(req, historyState, config, body = {}) {
     recent_messages: retryHydrateContextMessages,
     delta_messages: []
   };
-  const retryHydrateRunPayload = createRunPayloadFromHistory(historyState, prepared.queryItems);
+  const retryHydrateRunPayload = createRunPayloadFromHistory(historyState, prepared.queryItems, 'hydrate');
   const payload = {
     ...prepared.payload,
     spilliContext,
