@@ -11,7 +11,7 @@
     "test:claude": "node test/claude-cli.e2e.mjs"
   },
   "dependencies": {
-    "@synaptrix/spilli": "^0.4.6"
+    "@synaptrix/spilli": "^0.4.9"
   },
   "engines": {
     "node": ">=20"

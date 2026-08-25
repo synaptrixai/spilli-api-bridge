@@ -62,7 +62,6 @@ const state = {
   // Maps SpiLLI resource keys to one live SDK transport/allocation. Logical
   // chat histories are separated by spilli_context identities over this transport.
   resourceSessions: new Map(),
-  lastResolvedModelByScope: new Map(),
   // Maps bridge-managed client session keys to logical SpiLLI contexts.
   chatSessions: new Map()
 };
@@ -492,26 +491,6 @@ function normalizeResponseMode(value) {
   return 'raw';
 }
 
-function parseModelAliases(value) {
-  const aliases = new Map();
-  const raw = String(value ?? '').trim();
-  if (!raw) {
-    return aliases;
-  }
-  for (const entry of raw.split(/[;,]/)) {
-    const index = entry.indexOf('=');
-    if (index <= 0) {
-      continue;
-    }
-    const key = entry.slice(0, index).trim();
-    const target = entry.slice(index + 1).trim();
-    if (key && target) {
-      aliases.set(key, target);
-    }
-  }
-  return aliases;
-}
-
 function getConfig() {
   const allocationTimeoutMs = Number.parseInt(
     readEnv('SPILLI_BRIDGE_ALLOCATION_TIMEOUT_MS', readEnv('SPILLI_BRIDGE_REQUEST_TIMEOUT_MS')),
@@ -588,7 +567,6 @@ function getConfig() {
     modelCacheTtlMs:
       Number.isFinite(modelCacheTtlMs) && modelCacheTtlMs > 0 ? modelCacheTtlMs : DEFAULT_MODEL_CACHE_TTL_MS,
     nativeCacheDir: readEnv('SPILLI_BRIDGE_NATIVE_CACHE_DIR'),
-    modelAliases: parseModelAliases(readEnv('SPILLI_BRIDGE_MODEL_ALIASES')),
     responseMode: normalizeResponseMode(readEnv('SPILLI_BRIDGE_RESPONSE_MODE', 'compat')),
     askContinueOnMaxTokens:
       readEnv('SPILLI_BRIDGE_ASK_CONTINUE_ON_MAX_TOKENS', DEFAULT_ASK_CONTINUE_ON_MAX_TOKENS ? '1' : '0') !== '0',
@@ -1519,7 +1497,7 @@ function sourceModelIdFromClaudeDiscoveryModelId(modelId) {
   }
 }
 
-function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map()) {
+function resolveModelFromCatalog(requestedModel, catalog) {
   const requested = requestedModel.trim();
   if (!catalog.models.length) {
     throw Object.assign(new Error(`No SpiLLI models are available for scope "${catalog.scope}".`), { statusCode: 503 });
@@ -1530,7 +1508,7 @@ function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map
   if (requested.startsWith(CLAUDE_DISCOVERY_MODEL_PREFIX)) {
     const sourceModelId = sourceModelIdFromClaudeDiscoveryModelId(requested);
     if (sourceModelId) {
-      return resolveModelFromCatalog(sourceModelId, catalog, modelAliases);
+      return resolveModelFromCatalog(sourceModelId, catalog);
     }
   }
   const exactUid = catalog.models.find(model => model.uid === requested);
@@ -1568,16 +1546,6 @@ function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map
       statusCode: 404
     });
   }
-  for (const [alias, target] of modelAliases.entries()) {
-    if (normalizeModelLookupName(alias) !== normalized) {
-      continue;
-    }
-    const resolved = resolveModelFromCatalog(target, catalog, new Map());
-    return {
-      ...resolved,
-      requestedAlias: requested
-    };
-  }
   const available = catalog.models.map(model => model.apiName).join(', ');
   throw Object.assign(new Error(`Unknown model "${requested}". Available ${catalog.scope} models: ${available}`), {
     statusCode: 404
@@ -1586,30 +1554,14 @@ function resolveModelFromCatalog(requestedModel, catalog, modelAliases = new Map
 
 async function resolveRequestedModel(requestedModel, config) {
   let catalog = await fetchAvailableModels(config);
-  const cacheKey = catalogCacheKey(config);
   try {
-    const resolved = resolveModelFromCatalog(requestedModel, catalog, config.modelAliases);
-    state.lastResolvedModelByScope.set(cacheKey, resolved);
-    return resolved;
+    return resolveModelFromCatalog(requestedModel, catalog);
   } catch (err) {
     if (err?.statusCode !== 404) {
       throw err;
     }
     catalog = await fetchAvailableModels(config, { forceRefresh: true });
-    try {
-      const resolved = resolveModelFromCatalog(requestedModel, catalog, config.modelAliases);
-      state.lastResolvedModelByScope.set(cacheKey, resolved);
-      return resolved;
-    } catch (refreshedErr) {
-      if (refreshedErr?.statusCode === 404 && isBridgeBuiltInModelName(requestedModel)) {
-        const fallback = state.lastResolvedModelByScope.get(cacheKey) ?? catalog.models[0];
-        if (fallback) {
-          console.warn(`Mapping built-in bridge model alias "${requestedModel}" to SpiLLI model "${fallback.apiName}".`);
-          return fallback;
-        }
-      }
-      throw refreshedErr;
-    }
+    return resolveModelFromCatalog(requestedModel, catalog);
   }
 }
 
@@ -1803,11 +1755,6 @@ function normalizeToolNameForLookup(value) {
 
 function catalogCacheKey(config) {
   return `${config.keyPath}|${config.scope}|${config.team}`;
-}
-
-function isBridgeBuiltInModelName(value) {
-  const modelName = asString(value).trim();
-  return /^(claude[-_]|gpt[-_]|chatgpt[-_]|codex[-_]|o[1345](?:[-_]|$))/i.test(modelName);
 }
 
 function extractAvailableToolNames(tools) {
@@ -6974,6 +6921,7 @@ export {
   withResourceRunQueue,
   resourceCacheKey,
   renderText,
+  resolveModelFromCatalog,
   selectPreferredDisplayMatch,
   toAnthropicMessage,
   toResponsesOutputItems

@@ -167,7 +167,6 @@ Copy `.env.example` into your process manager or shell environment.
 - `SPILLI_BRIDGE_CONTEXT_OUTPUT_RESERVE_TOKENS`: minimum output-token reserve used when deriving bridge history budget from host limits, default `1024`.
 - `SPILLI_BRIDGE_RELEASE_EPHEMERAL_CONTEXTS`: release short-lived Claude Code and Codex subagent/utility KV contexts after success or failure, default `1`.
 - `SPILLI_BRIDGE_MAX_DURABLE_CONTEXTS_PER_RESOURCE`: maximum idle durable main-session contexts to keep warm per SpiLLI resource before LRU release, default `2`.
-- `SPILLI_BRIDGE_MODEL_ALIASES`: optional model aliases in `client_name=spilli_name` form, separated by commas or semicolons. No aliases are built in; model names pass through unchanged unless this variable is set.
 - `SPILLI_BRIDGE_RESPONSE_MODE`: response conversion mode, default `compat`.
   - `raw`: return SpiLLI model text as assistant text and do not infer tool calls.
   - `compat`: parse Harmony/JSON tool-call text into Anthropic/OpenAI tool-call objects for clients that need API-native tool calls.
@@ -267,6 +266,7 @@ Codex system threads (`thread_source: "system"` in `x-codex-turn-metadata`) and 
 
 Model selection follows the extension's current allocation rule:
 
+- Codex and Claude Code select from `/v1/models`; the bridge resolves the requested API name (including Claude's reversible discovery ID) to the scoped catalog entry's SpiLLI UID/resource hash.
 - A host-advertised full model uses the default V1 resource request.
 - A host-advertised fragment set or public-catalog model with `graph_v2` metadata uses V2 allocation metadata on the SDK resource request.
 - If both host inventory and public catalog describe the same logical model, host metadata wins and catalog metadata fills gaps.

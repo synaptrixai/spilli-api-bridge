@@ -30,6 +30,7 @@ import {
   parseToolCallsFromOutput,
   renderText,
   resourceCacheKey,
+  resolveModelFromCatalog,
   selectPreferredDisplayMatch,
   specializeSessionIdentityForHistory,
   toAnthropicMessage,
@@ -848,6 +849,25 @@ assert.equal(
   claudeModelsResponse.data[0].display_name,
   'tinygemma3-Q8_0.gguf',
   'Claude discovery preserves the SpiLLI display name'
+);
+
+const resolvedHashedModel = resolveModelFromCatalog('tinygemma3-Q8_0.gguf', {
+  scope: 'public',
+  models: responseCatalogModels
+});
+assert.equal(resolvedHashedModel.uid, 'gguf:sha256:abc123', 'display names resolve to the advertised resource hash');
+assert.equal(
+  resolveModelFromCatalog(claudeModelsResponse.data[0].id, {
+    scope: 'public',
+    models: responseCatalogModels
+  }).uid,
+  'gguf:sha256:abc123',
+  'Claude discovery ids resolve back to the advertised resource hash'
+);
+assert.throws(
+  () => resolveModelFromCatalog('gpt-unknown-alias', { scope: 'public', models: responseCatalogModels }),
+  /Unknown model/,
+  'unknown client model names are not silently redirected to another resource'
 );
 
 assert.deepEqual(
