@@ -11,7 +11,9 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libcurl4 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/node/.cache/huggingface \
+    && chown -R node:node /home/node/.cache
 
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
@@ -26,6 +28,6 @@ ENV SPILLI_BRIDGE_PORT=8888
 ENV SPILLI_KEY_PATH=/home/node/.spilli
 ENV SPILLI_BRIDGE_RESPONSE_MODE=compat
 
-EXPOSE 8888
+# EXPOSE 8888
 
 CMD ["npm", "start"]

@@ -133,11 +133,18 @@ Set `SPILLI_BRIDGE_AUTH_TOKEN=sk-spilli-local` before starting the bridge if you
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 - `POST /v1/chat/completions`
+- `POST /v1/embeddings`
 - `POST /v1/responses`
 
 `/v1/messages` supports non-streaming responses and Anthropic SSE streaming.
 
 `/v1/chat/completions` and `/v1/responses` support non-streaming and OpenAI-style SSE streaming.
+
+`/v1/embeddings` provides normalized CPU embeddings when
+`SPILLI_BRIDGE_EMBEDDING_BACKEND=local`. It accepts OpenAI-compatible string or
+string-array input and returns float vectors. The default model is
+`onnx-community/all-MiniLM-L6-v2-ONNX` with 384 dimensions; its files are
+downloaded lazily on the first request and cached locally.
 
 ## Configuration
 
@@ -150,6 +157,14 @@ Copy `.env.example` into your process manager or shell environment.
   `SpiLLI_Enterprise.pem`, `SpiLLI_Team.pem`, `SpiLLI_Personal.pem`, then `SpiLLI_Community.pem`.
 - `SPILLI_BRIDGE_TEAM`: optional fallback team name for team-scoped requests. Runtime `POST /v1/scope` with `team_name` is preferred.
 - `SPILLI_BRIDGE_AUTH_TOKEN`: optional local bearer/API key.
+- `SPILLI_BRIDGE_EMBEDDING_BACKEND`: `local` enables the CPU embedding endpoint; default `disabled`.
+- `SPILLI_BRIDGE_EMBEDDING_MODEL`: Transformers.js feature-extraction model; default `onnx-community/all-MiniLM-L6-v2-ONNX`.
+- `SPILLI_BRIDGE_EMBEDDING_DIMENSIONS`: fixed output dimensions used for validation; default `384`.
+- `SPILLI_BRIDGE_EMBEDDING_DTYPE`: ONNX model dtype; default `fp32`.
+- `SPILLI_BRIDGE_EMBEDDING_MAX_BATCH_SIZE`: maximum strings per request; default `32`.
+- `SPILLI_BRIDGE_EMBEDDING_MAX_INPUT_CHARS`: maximum characters per input; default `32000`.
+- `SPILLI_BRIDGE_EMBEDDING_THREADS`: ONNX CPU inference threads; default `2`.
+- `SPILLI_BRIDGE_EMBEDDING_CACHE_DIR`: optional persistent Hugging Face model cache directory.
 - `SPILLI_BRIDGE_ALLOCATION_TIMEOUT_MS`: timeout for acquiring a SpiLLI model/session, default `60000`. The legacy `SPILLI_BRIDGE_REQUEST_TIMEOUT_MS` is still accepted as an allocation-timeout fallback.
 - `SPILLI_BRIDGE_RUN_TIMEOUT_MS`: timeout for prompt hydration and generation after allocation, default `300000`.
 - `SPILLI_BRIDGE_MODEL_CACHE_TTL_MS`: live model inventory cache TTL, default `30000`.

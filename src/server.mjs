@@ -11,6 +11,7 @@ import {
   renderHarmonyForDisplay,
   resolveSpilliKeyFile
 } from '@synaptrix/spilli';
+import { createEmbeddingResponse, embeddingConfigFromEnv } from './embeddings.mjs';
 
 const DEFAULT_PORT = 8888;
 const DEFAULT_ALLOCATION_TIMEOUT_MS = 60_000;
@@ -559,6 +560,7 @@ function getConfig() {
     scope,
     team: state.modelTeam ?? readEnv('SPILLI_BRIDGE_TEAM'),
     authToken: readEnv('SPILLI_BRIDGE_AUTH_TOKEN'),
+    embeddings: embeddingConfigFromEnv(),
     allocationTimeoutMs:
       Number.isFinite(allocationTimeoutMs) && allocationTimeoutMs > 0
         ? allocationTimeoutMs
@@ -6829,6 +6831,12 @@ async function handleScope(req, res, config) {
   json(res, 200, scopePayload(getConfig(), `Model scope set to "${normalized}".`));
 }
 
+async function handleOpenAiEmbeddings(req, res, config) {
+  const body = await readBody(req);
+  const response = await createEmbeddingResponse(body, config.embeddings);
+  json(res, 200, response);
+}
+
 async function route(req, res) {
   const config = getConfig();
   const url = new URL(req.url ?? '/', `http://${req.headers.host || 'localhost'}`);
@@ -6850,7 +6858,13 @@ async function route(req, res) {
       team_name: config.team || null,
       response_mode: config.responseMode,
       scope_configurable: true,
-      dynamic_models: true
+      dynamic_models: true,
+      embeddings: {
+        enabled: config.embeddings.backend === 'local',
+        backend: config.embeddings.backend,
+        model: config.embeddings.backend === 'local' ? config.embeddings.model : null,
+        dimensions: config.embeddings.backend === 'local' ? config.embeddings.dimensions : null
+      }
     });
     return;
   }
@@ -6883,6 +6897,10 @@ async function route(req, res) {
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
     await handleOpenAiChatCompletions(req, res, config);
+    return;
+  }
+  if (req.method === 'POST' && (url.pathname === '/v1/embeddings' || url.pathname === '/embeddings')) {
+    await handleOpenAiEmbeddings(req, res, config);
     return;
   }
   json(res, 404, { error: { type: 'not_found_error', message: `No route for ${req.method} ${url.pathname}` } });
